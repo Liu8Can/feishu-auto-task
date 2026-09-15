@@ -1,0 +1,16 @@
+{
+  "work_duration_minutes": 480,
+  "buffer_minutes": 5,
+  "check_interval_minutes": 5,
+  "check_start_time": "15:00",
+  "check_end_time": "23:30",
+  "mode": "dry_run",
+  "weekdays": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "auto_open_workbench": true
+}
