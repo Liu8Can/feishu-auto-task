@@ -59,6 +59,7 @@ def test_workday_overrides_are_deterministic() -> None:
     assert not is_workday(saturday)
     assert is_workday(saturday, extra_workdays=frozenset({saturday}))
     assert not is_workday(monday, excluded_dates=frozenset({monday}))
+    assert not is_workday(monday, weekdays=frozenset({1, 2, 3, 4}))
     assert not is_workday(
         saturday,
         extra_workdays=frozenset({saturday}),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .core import (
     AttendanceSnapshot,
@@ -16,11 +16,13 @@ from .storage import JsonStateStore
 
 
 class AttendanceAdapter(Protocol):
-    def snapshot(self) -> AttendanceSnapshot: ...
+    def snapshot(self, day: date) -> AttendanceSnapshot: ...
 
-    def click_clock_out(self) -> None: ...
+    def click_clock_out(self, expected_signature: str) -> None: ...
 
     def verify_success(self) -> bool: ...
+
+    def is_session_interactive(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +32,7 @@ class EngineConfig:
     safety_buffer_minutes: int = 5
     check_start_time: time = time(15, 0)
     check_end_time: time = time(23, 30)
-    skip_weekends: bool = True
+    weekdays: frozenset[int] = frozenset({0, 1, 2, 3, 4})
     extra_workdays: frozenset[date] = frozenset()
     excluded_dates: frozenset[date] = frozenset()
 
@@ -41,6 +43,8 @@ class EngineConfig:
             raise ValueError("工作时长和安全缓冲不能为负数")
         if self.check_start_time > self.check_end_time:
             raise ValueError("第一版不支持跨自然日的检查时间窗")
+        if not self.weekdays or any(day not in range(7) for day in self.weekdays):
+            raise ValueError("工作日配置无效")
 
 
 class ClockoutEngine:
@@ -49,16 +53,19 @@ class ClockoutEngine:
         adapter: AttendanceAdapter,
         store: JsonStateStore,
         config: EngineConfig | None = None,
+        now_provider: Callable[[], datetime] = datetime.now,
     ) -> None:
         self.adapter = adapter
         self.store = store
         self.config = config or EngineConfig()
+        self._now_provider = now_provider
 
-    def check(self, now: datetime) -> CheckResult:
+    def check(self, now: datetime | None = None) -> CheckResult:
+        now = now or self._now_provider()
         day = now.date()
         if not is_workday(
             day,
-            skip_weekends=self.config.skip_weekends,
+            weekdays=self.config.weekdays,
             extra_workdays=self.config.extra_workdays,
             excluded_dates=self.config.excluded_dates,
         ):
@@ -68,14 +75,20 @@ class ClockoutEngine:
         ):
             return CheckResult("skipped", "当前不在允许检查的时间范围")
 
-        existing = self.store.load(day)
+        try:
+            existing = self.store.load(day)
+        except Exception:
+            return CheckResult("blocked", "每日状态文件损坏或无法读取")
         if existing is not None and existing.clock_out_attempted:
             return CheckResult("already_attempted", "今天已经执行过自动打卡尝试")
 
-        first = self._read_snapshot()
+        if self.config.mode == "automatic" and not self._session_is_interactive():
+            return CheckResult("blocked", "Windows 当前不是可交互桌面会话")
+
+        first = self._read_snapshot(day)
         if isinstance(first, CheckResult):
             return first
-        precheck = self._validate_snapshot(first, now)
+        precheck = self._validate_snapshot(first, now, day)
         if precheck is not None:
             return precheck
 
@@ -101,10 +114,11 @@ class ClockoutEngine:
                 eligible_time,
             )
 
-        second = self._read_snapshot()
+        second = self._read_snapshot(day)
         if isinstance(second, CheckResult):
             return second
-        second_precheck = self._validate_snapshot(second, now)
+        final_now = self._now_provider()
+        second_precheck = self._validate_snapshot(second, final_now, day)
         if second_precheck is not None:
             return second_precheck
         if not snapshots_match(first, second):
@@ -115,12 +129,58 @@ class ClockoutEngine:
                 eligible_time,
             )
 
-        claimed = self.store.claim_attempt(
-            day,
-            check_in_time=first.check_in_time.strftime("%H:%M"),
-            eligible_time=eligible_time,
-            attempted_at=now,
-        )
+        if final_now.date() != day:
+            return CheckResult(
+                "blocked",
+                "点击前日期已经变化",
+                first.check_in_time,
+                eligible_time,
+            )
+        if final_now < now:
+            return CheckResult(
+                "blocked",
+                "检测到系统时间回拨",
+                first.check_in_time,
+                eligible_time,
+            )
+        if not is_within_window(
+            final_now, self.config.check_start_time, self.config.check_end_time
+        ):
+            return CheckResult(
+                "blocked",
+                "点击前已经离开允许检查的时间范围",
+                first.check_in_time,
+                eligible_time,
+            )
+        if final_now < eligible_time:
+            return CheckResult(
+                "blocked",
+                "点击前尚未到最早允许下班打卡时间",
+                first.check_in_time,
+                eligible_time,
+            )
+        if not self._session_is_interactive():
+            return CheckResult(
+                "blocked",
+                "点击前 Windows 已不再是可交互桌面会话",
+                first.check_in_time,
+                eligible_time,
+            )
+
+        try:
+            claimed = self.store.claim_attempt(
+                day,
+                check_in_time=first.check_in_time.strftime("%H:%M"),
+                eligible_time=eligible_time,
+                attempted_at=final_now,
+            )
+        except Exception:
+            return CheckResult(
+                "blocked",
+                "无法安全写入每日打卡状态",
+                first.check_in_time,
+                eligible_time,
+            )
         if not claimed:
             return CheckResult(
                 "already_attempted",
@@ -130,9 +190,9 @@ class ClockoutEngine:
             )
 
         try:
-            self.adapter.click_clock_out()
+            self.adapter.click_clock_out(second.signature)
         except Exception:
-            self.store.record_outcome(day, "click_failed", success=False)
+            self._record_outcome(day, "click_failed", success=False)
             return CheckResult(
                 "unknown",
                 "点击未完成，今天不会自动重试",
@@ -145,7 +205,7 @@ class ClockoutEngine:
         except Exception:
             success = False
         if not success:
-            self.store.record_outcome(day, "unknown", success=False)
+            self._record_outcome(day, "unknown", success=False)
             return CheckResult(
                 "unknown",
                 "未确认打卡成功，今天不会自动重试",
@@ -153,7 +213,7 @@ class ClockoutEngine:
                 eligible_time,
             )
 
-        self.store.record_outcome(day, "success", success=True)
+        self._record_outcome(day, "success", success=True)
         return CheckResult(
             "success",
             "已确认下班打卡成功",
@@ -161,15 +221,30 @@ class ClockoutEngine:
             eligible_time,
         )
 
-    def _read_snapshot(self) -> AttendanceSnapshot | CheckResult:
+    def _read_snapshot(self, day: date) -> AttendanceSnapshot | CheckResult:
         try:
-            return self.adapter.snapshot()
+            return self.adapter.snapshot(day)
         except Exception:
             return CheckResult("blocked", "无法可靠读取飞书考勤页面")
 
+    def _session_is_interactive(self) -> bool:
+        try:
+            return self.adapter.is_session_interactive()
+        except Exception:
+            return False
+
+    def _record_outcome(self, day: date, outcome: str, *, success: bool) -> None:
+        try:
+            self.store.record_outcome(day, outcome, success=success)
+        except Exception:
+            # The durable attempted flag was written before clicking, so retry stays blocked.
+            pass
+
     def _validate_snapshot(
-        self, snapshot: AttendanceSnapshot, now: datetime
+        self, snapshot: AttendanceSnapshot, now: datetime, expected_day: date
     ) -> CheckResult | None:
+        if snapshot.page_date != expected_day:
+            return CheckResult("blocked", "未确认当前页面属于今天")
         if snapshot.check_in_time is None:
             return CheckResult("blocked", "未识别到唯一的上班打卡时间")
         eligible_time = calculate_eligible_time(
@@ -203,6 +278,13 @@ class ClockoutEngine:
             return CheckResult(
                 "blocked",
                 "页面快照缺少一致性标识",
+                snapshot.check_in_time,
+                eligible_time,
+            )
+        if not snapshot.container_id or not snapshot.button_id:
+            return CheckResult(
+                "blocked",
+                "考勤页面或下班按钮缺少稳定身份标识",
                 snapshot.check_in_time,
                 eligible_time,
             )

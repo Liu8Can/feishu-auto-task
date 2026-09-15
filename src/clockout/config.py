@@ -33,8 +33,10 @@ class AppConfig:
             raise ValueError("安全缓冲必须在 0 到 180 分钟之间")
         if not 1 <= self.check_interval_minutes <= 60:
             raise ValueError("检查间隔必须在 1 到 60 分钟之间")
-        _parse_time(self.check_start_time)
-        _parse_time(self.check_end_time)
+        start = _parse_time(self.check_start_time)
+        end = _parse_time(self.check_end_time)
+        if start > end:
+            raise ValueError("第一版不支持跨自然日的检查时间窗")
         if self.mode not in {"dry_run", "automatic"}:
             raise ValueError("运行模式只能是 dry_run 或 automatic")
         if not self.weekdays or any(day not in range(7) for day in self.weekdays):
@@ -75,4 +77,3 @@ def save_config(path: Path, config: AppConfig) -> None:
         encoding="utf-8",
     )
     os.replace(temp_path, path)
-

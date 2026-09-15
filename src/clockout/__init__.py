@@ -8,7 +8,7 @@ from .core import (
     parse_unique_check_in_time,
 )
 from .engine import AttendanceAdapter, ClockoutEngine, EngineConfig
-from .storage import DailyState, JsonStateStore
+from .storage import DailyState, JsonStateStore, StateCorruptionError, StateStoreError
 
 __all__ = [
     "AttendanceAdapter",
@@ -19,6 +19,8 @@ __all__ = [
     "DailyState",
     "EngineConfig",
     "JsonStateStore",
+    "StateCorruptionError",
+    "StateStoreError",
     "calculate_eligible_time",
     "is_within_window",
     "is_workday",

@@ -227,9 +227,9 @@ class ClockoutDemoApp:
             safety_buffer_minutes=self.config.buffer_minutes,
             check_start_time=self.config.start_time,
             check_end_time=self.config.end_time,
-            skip_weekends=True,
+            weekdays=frozenset(self.config.weekdays),
         )
-        return ClockoutEngine(self.adapter, self.store, config)
+        return ClockoutEngine(self.adapter, self.store, config, now_provider=datetime.now)
 
     def _change_mode(self) -> None:
         requested = self.mode_var.get()
@@ -285,7 +285,13 @@ class ClockoutDemoApp:
         self._log("开始检查")
 
         def work() -> None:
-            result = self._engine().check(now)
+            try:
+                result = self._engine().check(now)
+            except Exception as exc:
+                self.logger.exception("后台检查异常")
+                result = CheckResult(
+                    "blocked", f"检查异常，自动监控已暂停：{type(exc).__name__}"
+                )
             self.root.after(0, lambda: self._finish_check(result))
 
         threading.Thread(target=work, daemon=True, name="attendance-check").start()
@@ -306,7 +312,9 @@ class ClockoutDemoApp:
             self.next_check = now + timedelta(minutes=self.config.check_interval_minutes)
 
         self._log("%s：%s", STATUS_LABELS.get(result.status, result.status), result.message)
-        if result.status in {"success", "unknown"}:
+        if result.status in {"success", "unknown"} or (
+            result.status == "blocked" and result.message.startswith("检查异常")
+        ):
             self.running = False
             self.next_check = None
             self.monitor_button_var.set("开始监控")
@@ -383,4 +391,3 @@ class ClockoutDemoApp:
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
         return logger
-

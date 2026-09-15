@@ -24,6 +24,7 @@ def test_config_round_trip_preserves_chinese_safe_json(tmp_path: object) -> None
         {"buffer_minutes": -1},
         {"check_interval_minutes": 0},
         {"check_start_time": "25:00"},
+        {"check_start_time": "23:00", "check_end_time": "15:00"},
         {"mode": "unsafe"},
     ],
 )

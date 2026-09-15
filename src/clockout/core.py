@@ -12,12 +12,15 @@ class CheckInTimeError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class AttendanceSnapshot:
+    page_date: date | None
     check_in_time: time | None
     already_clocked_out: bool
     button_count: int
     button_enabled: bool
     blocking_reason: str | None
     signature: str
+    container_id: str
+    button_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +82,7 @@ def calculate_eligible_time(
 def is_workday(
     day: date,
     *,
-    skip_weekends: bool = True,
+    weekdays: frozenset[int] = frozenset({0, 1, 2, 3, 4}),
     extra_workdays: frozenset[date] = frozenset(),
     excluded_dates: frozenset[date] = frozenset(),
 ) -> bool:
@@ -87,7 +90,7 @@ def is_workday(
         return False
     if day in extra_workdays:
         return True
-    return not skip_weekends or day.weekday() < 5
+    return day.weekday() in weekdays
 
 
 def is_within_window(moment: datetime, start: time, end: time) -> bool:
