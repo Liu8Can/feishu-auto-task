@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import time as time_module
+import winreg
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, time
@@ -23,8 +24,11 @@ FEISHU_EXECUTABLE = "feishu.exe"
 FEISHU_WINDOW_TITLES = ("飞书", "假勤")
 ATTENDANCE_PAGE_NAMES = ("考勤打卡", "假勤")
 BARE_CLOCKED_PATTERN = re.compile(r"^已打卡\s*[:：]?\s*(\d{1,2}:\d{2})$")
-WORKBENCH_URI = "lark://appcenter.open"
-ATTENDANCE_ENTRY_NAMES = ("假勤", "考勤打卡", "考勤")
+ATTENDANCE_ENTRY_NAMES = ("假勤", "考勤打卡")
+FEISHU_PROTOCOL_COMMAND_KEY = r"Software\Classes\lark\shell\open\command"
+EXECUTABLE_FROM_COMMAND_PATTERN = re.compile(
+    r'^\s*(?:"([^"]+\.exe)"|([^\s]+\.exe))', re.IGNORECASE
+)
 NAVIGATION_POLL_INTERVAL = 0.2
 SUCCESS_PATTERNS = (
     re.compile(r"下班已打卡(?:\s*\d{1,2}:\d{2})?"),
@@ -64,7 +68,7 @@ class FeishuUiaAdapter:
         self,
         *,
         auto_open_workbench: bool = True,
-        navigation_wait: float = 3.0,
+        navigation_wait: float = 15.0,
         trusted_container_fingerprint: str = "",
     ):
         self.auto_open_workbench = auto_open_workbench
@@ -275,8 +279,13 @@ class FeishuUiaAdapter:
     def is_session_interactive(self) -> bool:
         return is_interactive_desktop()
 
-    def open_workbench(self) -> None:
-        os.startfile(WORKBENCH_URI)
+    def launch_feishu(self) -> None:
+        if self._main_window() is not None:
+            return
+        executable = self._registered_feishu_executable()
+        if executable is None:
+            raise OSError("未找到飞书安装路径")
+        os.startfile(executable)
 
     def open_attendance_page(self, day: date) -> bool:
         """Open and confirm today's unique attendance page without binding it."""
@@ -346,7 +355,7 @@ class FeishuUiaAdapter:
             return page
 
         try:
-            self.open_workbench()
+            self.launch_feishu()
         except OSError:
             return None
 
@@ -395,6 +404,7 @@ class FeishuUiaAdapter:
         try:
             if window.is_minimized():
                 window.restore()
+                time_module.sleep(0.8)
             window.set_focus()
         except Exception:
             return False
@@ -405,6 +415,28 @@ class FeishuUiaAdapter:
             window for window in self._feishu_windows() if self._text(window) == "飞书"
         ]
         return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _registered_feishu_executable() -> str | None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, FEISHU_PROTOCOL_COMMAND_KEY
+            ) as key:
+                command = winreg.QueryValueEx(key, "")[0]
+        except OSError:
+            return None
+        if not isinstance(command, str):
+            return None
+        match = EXECUTABLE_FROM_COMMAND_PATTERN.match(command)
+        if match is None:
+            return None
+        executable = os.path.expandvars(match.group(1) or match.group(2))
+        if (
+            os.path.basename(executable).casefold() != FEISHU_EXECUTABLE
+            or not os.path.isfile(executable)
+        ):
+            return None
+        return executable
 
     def _feishu_windows(self) -> list[object]:
         candidates = []
@@ -524,19 +556,46 @@ class FeishuUiaAdapter:
         entry = self._attendance_entry(window)
         if entry is None:
             return False
+        return self._activate_navigation_control(entry)
+
+    @staticmethod
+    def _activate_navigation_control(control) -> bool:
         try:
-            entry.invoke()
+            control_type = control.element_info.control_type
+            if control_type == "Button":
+                control.invoke()
+            else:
+                control.click_input()
         except Exception:
             return False
         return True
 
     def _attendance_entry(self, window):
-        matches = []
-        for control in window.descendants():
+        controls = window.descendants()
+        pinned_matches = []
+        for control in controls:
             try:
                 text = self._text(control)
                 if (
                     text in ATTENDANCE_ENTRY_NAMES
+                    and control.element_info.control_type == "TabItem"
+                    and control.is_visible()
+                    and control.is_enabled()
+                ):
+                    pinned_matches.append(control)
+            except Exception:
+                continue
+        unique_pinned = self._deduplicate_controls(pinned_matches, window)
+        if unique_pinned is None or len(unique_pinned) > 1:
+            return None
+        if len(unique_pinned) == 1:
+            return unique_pinned[0]
+
+        matches = []
+        for control in controls:
+            try:
+                if (
+                    self._text(control) in ATTENDANCE_ENTRY_NAMES
                     and control.is_visible()
                     and control.is_enabled()
                 ):
