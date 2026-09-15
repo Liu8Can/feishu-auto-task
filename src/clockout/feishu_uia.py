@@ -10,13 +10,19 @@ from datetime import date, time
 from typing import Iterable
 
 import pythoncom
+import win32gui
 from pywinauto import Desktop
+from pywinauto.application import process_module
 
 from .core import AttendanceSnapshot, parse_unique_check_in_time
 from .session import is_interactive_desktop
 
 
 CHECKOUT_BUTTON_TEXT = "下班打卡"
+FEISHU_EXECUTABLE = "feishu.exe"
+FEISHU_WINDOW_TITLES = ("飞书", "假勤")
+ATTENDANCE_PAGE_NAMES = ("考勤打卡", "假勤")
+BARE_CLOCKED_PATTERN = re.compile(r"^已打卡\s*[:：]?\s*(\d{1,2}:\d{2})$")
 WORKBENCH_URI = "lark://appcenter.open"
 ATTENDANCE_ENTRY_NAMES = ("考勤打卡", "考勤")
 SUCCESS_PATTERNS = (
@@ -77,34 +83,28 @@ class FeishuUiaAdapter:
         self._clear_pending_button()
         if not self.trusted_container_fingerprint:
             return self._blocked("尚未绑定当前飞书考勤页面")
-        window = self._main_window()
-        if window is None and self.auto_open_workbench:
+        page = self._attendance_page(day, require_trusted=True)
+        if page is None and self.auto_open_workbench:
             self.open_workbench()
-            window = self._wait_for_main_window()
-        if window is None:
-            return self._blocked("未找到飞书主窗口")
+            time_module.sleep(self.navigation_wait)
+            page = self._attendance_page(day, require_trusted=True)
+            if page is None:
+                window = self._main_window()
+                if window is not None:
+                    self._open_attendance_entry(window)
+                    time_module.sleep(self.navigation_wait)
+                    page = self._attendance_page(day, require_trusted=True)
+        if page is None:
+            return self._blocked("未确认当前页面为今天的考勤打卡页")
 
+        window, context = page
         was_minimized = bool(window.is_minimized())
         self._restore_after_action = was_minimized
         try:
             if was_minimized:
                 window.restore()
                 time_module.sleep(0.8)
-            context = self._attendance_context(window, day, require_trusted=True)
-            if context is None and self.auto_open_workbench:
-                self.open_workbench()
-                time_module.sleep(self.navigation_wait)
-                window = self._main_window()
-                if window is None:
-                    return self._blocked("打开飞书工作台后未找到主窗口")
                 context = self._attendance_context(window, day, require_trusted=True)
-                if context is None:
-                    self._open_attendance_entry(window)
-                    time_module.sleep(self.navigation_wait)
-                    window = self._main_window()
-                    if window is None:
-                        return self._blocked("打开考勤入口后未找到飞书主窗口")
-                    context = self._attendance_context(window, day, require_trusted=True)
 
             if context is None:
                 return self._blocked("未确认当前页面为今天的考勤打卡页")
@@ -136,62 +136,137 @@ class FeishuUiaAdapter:
 
     def click_clock_out(self, expected_signature: str) -> None:
         with self._com_scope():
-            window = self._main_window()
-            if window is None:
-                self._restore_after_action = False
-                raise RuntimeError("点击前未找到飞书主窗口")
+            window = None
             try:
-                if self._pending_signature != expected_signature or self._pending_day is None:
-                    raise RuntimeError("点击目标与最终页面快照不一致")
+                window, button = self._confirmed_checkout_target(expected_signature)
                 if window.is_minimized():
                     window.restore()
                     time_module.sleep(0.8)
-                if not is_interactive_desktop():
-                    raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
-                context = self._attendance_context(
-                    window, self._pending_day, require_trusted=True
-                )
-                if context is None:
-                    raise RuntimeError("点击前无法重新确认考勤页面")
-                if (
-                    context.container_runtime_id
-                    != self._pending_container_runtime_id
-                    or context.button_runtime_id != self._pending_button_runtime_id
-                ):
-                    raise RuntimeError("点击前考勤容器或按钮实例已经变化")
-                final_snapshot = self._build_snapshot(
-                    context.texts,
-                    context.buttons,
-                    day=self._pending_day,
-                    container_id=context.container_id,
-                    button_id=context.button_id,
-                )
-                if final_snapshot.signature != expected_signature:
-                    raise RuntimeError("点击前页面状态已经变化")
-                if len(context.buttons) != 1:
-                    raise RuntimeError("点击前下班打卡按钮不唯一")
-                button = context.buttons[0]
-                if self._text(button) != CHECKOUT_BUTTON_TEXT:
-                    raise RuntimeError("点击前按钮文字已经变化")
-                if not button.is_enabled() or not button.is_visible():
-                    raise RuntimeError("点击前下班打卡按钮不唯一或不可用")
+                    window, button = self._confirmed_checkout_target(
+                        expected_signature
+                    )
+                if button.element_info.control_type == "Text":
+                    window.set_focus()
+                    time_module.sleep(0.2)
+                    window, button = self._confirmed_checkout_target(
+                        expected_signature
+                    )
+                    self._validate_text_click_target(window, button)
+                    if not is_interactive_desktop():
+                        raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
                 self._clear_pending_button(keep_restore=True)
-                button.invoke()
+                self._invoke_checkout_control(button)
             except Exception as exc:
-                self._restore_window(window)
+                if window is not None:
+                    self._restore_window(window)
+                else:
+                    self._restore_after_action = False
                 raise RuntimeError("下班打卡按钮无法安全调用") from exc
+
+    def _confirmed_checkout_target(
+        self, expected_signature: str
+    ) -> tuple[object, object]:
+        if (
+            self._pending_day is None
+            or self._pending_signature != expected_signature
+        ):
+            raise RuntimeError("点击目标与最终页面快照不一致")
+        if not is_interactive_desktop():
+            raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
+        page = self._attendance_page(self._pending_day, require_trusted=True)
+        if page is None:
+            raise RuntimeError("点击前未找到唯一考勤窗口")
+        window, context = page
+        if (
+            context.container_runtime_id != self._pending_container_runtime_id
+            or context.button_runtime_id != self._pending_button_runtime_id
+        ):
+            raise RuntimeError("点击前考勤容器或按钮实例已经变化")
+        final_snapshot = self._build_snapshot(
+            context.texts,
+            context.buttons,
+            day=self._pending_day,
+            container_id=context.container_id,
+            button_id=context.button_id,
+        )
+        if (
+            final_snapshot.signature != expected_signature
+            or final_snapshot.page_date != self._pending_day
+            or final_snapshot.blocking_reason is not None
+        ):
+            raise RuntimeError("点击前页面状态已经变化")
+        if len(context.buttons) != 1:
+            raise RuntimeError("点击前下班打卡按钮不唯一")
+        button = context.buttons[0]
+        if self._text(button) != CHECKOUT_BUTTON_TEXT:
+            raise RuntimeError("点击前按钮文字已经变化")
+        if not button.is_enabled() or not button.is_visible():
+            raise RuntimeError("点击前下班打卡按钮不唯一或不可用")
+        return window, button
+
+    @classmethod
+    def _top_level_window_handle(cls, control) -> int:
+        current = control
+        for _ in range(64):
+            try:
+                if current.element_info.control_type == "Window":
+                    return int(current.handle)
+                current = current.parent()
+            except Exception:
+                return 0
+        return 0
+
+    def _validate_text_click_target(self, window, button) -> None:
+        window_handle = int(window.handle)
+        if int(win32gui.GetForegroundWindow()) != window_handle:
+            raise RuntimeError("点击前考勤窗口未处于前台")
+        button_runtime_id = self._runtime_identity(button, window)
+        if not button_runtime_id or button_runtime_id != self._pending_button_runtime_id:
+            raise RuntimeError("点击前下班打卡按钮实例已经变化")
+        rectangle = button.rectangle()
+        if rectangle.right <= rectangle.left or rectangle.bottom <= rectangle.top:
+            raise RuntimeError("点击前下班打卡目标位置无效")
+        center_x = (rectangle.left + rectangle.right) // 2
+        center_y = (rectangle.top + rectangle.bottom) // 2
+        hit_control = Desktop(backend="uia").from_point(center_x, center_y)
+        if self._top_level_window_handle(hit_control) != window_handle:
+            raise RuntimeError("下班打卡目标被其他窗口遮挡")
+        if not self._control_chain_contains_identity(
+            hit_control, button_runtime_id, window
+        ):
+            raise RuntimeError("下班打卡目标被页面内其他控件遮挡")
+        if int(win32gui.GetForegroundWindow()) != window_handle:
+            raise RuntimeError("点击前考勤窗口已离开前台")
+
+    @classmethod
+    def _control_chain_contains_identity(
+        cls, control, expected_identity: tuple[object, ...], root
+    ) -> bool:
+        current = control
+        for _ in range(64):
+            if cls._runtime_identity(current, root) == expected_identity:
+                return True
+            try:
+                if current.element_info.control_type == "Window":
+                    return False
+                current = current.parent()
+            except Exception:
+                return False
+        return False
 
     def verify_success(self) -> bool:
         time_module.sleep(2.5)
         with self._com_scope():
-            window = self._main_window()
-            if window is None:
+            if self._pending_day is None:
+                self._restore_after_action = False
+                return False
+            page = self._attendance_page(self._pending_day, require_trusted=True)
+            if page is None:
                 self._restore_after_action = False
                 self._pending_day = None
                 return False
+            window, context = page
             try:
-                if self._pending_day is None:
-                    return False
                 context = self._attendance_context(
                     window, self._pending_day, require_trusted=True
                 )
@@ -201,7 +276,7 @@ class FeishuUiaAdapter:
                     pattern.search(text)
                     for pattern in SUCCESS_PATTERNS
                     for text in context.texts
-                )
+                ) or self._has_independent_checkout_record(context.texts)
             finally:
                 self._restore_window(window)
                 self._pending_day = None
@@ -214,12 +289,15 @@ class FeishuUiaAdapter:
 
     def diagnostics(self) -> dict[str, object]:
         with self._com_scope():
-            window = self._main_window()
-            if window is None:
+            windows = self._feishu_windows()
+            if not windows:
                 return {"window_found": False, "element_count": 0, "named_count": 0}
-            descendants = window.descendants()
+            descendants = [
+                control for window in windows for control in window.descendants()
+            ]
             named_count = sum(bool(self._text(control)) for control in descendants)
-            context = self._attendance_context(window, date.today(), require_trusted=False)
+            page = self._attendance_page(date.today(), require_trusted=False)
+            context = page[1] if page else None
             return {
                 "window_found": True,
                 "element_count": len(descendants),
@@ -233,53 +311,70 @@ class FeishuUiaAdapter:
         with self._com_scope():
             if not is_interactive_desktop():
                 raise RuntimeError("Windows 当前不是可交互桌面会话")
-            window = self._main_window()
-            if window is None:
-                raise RuntimeError("未找到飞书主窗口")
+            page = self._attendance_page(day, require_trusted=False)
+            if page is None:
+                raise RuntimeError("当前页面不是可唯一确认的今日考勤页")
+            window, context = page
             if window.is_minimized():
                 window.restore()
                 time_module.sleep(0.8)
-            context = self._attendance_context(window, day, require_trusted=False)
+                context = self._attendance_context(window, day, require_trusted=False)
             if context is None:
                 raise RuntimeError("当前页面不是可唯一确认的今日考勤页")
             self.trusted_container_fingerprint = context.container_id
             return context.container_id
 
     def _main_window(self):
+        candidates = [
+            window for window in self._feishu_windows() if self._text(window) == "飞书"
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _feishu_windows(self) -> list[object]:
         candidates = []
-        for window in Desktop(backend="uia").windows(title="飞书", control_type="Window"):
+        for window in Desktop(backend="uia").windows(control_type="Window"):
             try:
-                if window.class_name() == "Chrome_WidgetWin_1":
+                executable = os.path.basename(
+                    process_module(window.process_id())
+                ).casefold()
+                if (
+                    window.class_name() == "Chrome_WidgetWin_1"
+                    and self._text(window) in FEISHU_WINDOW_TITLES
+                    and executable == FEISHU_EXECUTABLE
+                ):
                     candidates.append(window)
             except Exception:
                 continue
-        return candidates[0] if len(candidates) == 1 else None
+        return candidates
 
-    def _wait_for_main_window(self):
-        deadline = time_module.monotonic() + 8
-        while time_module.monotonic() < deadline:
-            window = self._main_window()
-            if window is not None:
-                return window
-            time_module.sleep(0.5)
-        return None
+    def _attendance_page(
+        self, day: date, *, require_trusted: bool
+    ) -> tuple[object, _AttendanceContext] | None:
+        candidates = []
+        for window in self._feishu_windows():
+            context = self._attendance_context(
+                window, day, require_trusted=require_trusted
+            )
+            if context is not None:
+                candidates.append((window, context))
+        return candidates[0] if len(candidates) == 1 else None
 
     def _attendance_context(
         self, window, day: date, *, require_trusted: bool
     ) -> _AttendanceContext | None:
         candidates: dict[tuple[object, ...], _AttendanceContext] = {}
-        title_controls = [
+        anchor_controls = [
             control
             for control in window.descendants()
-            if self._text(control) == "考勤打卡"
+            if self._text(control) in ("考勤打卡", CHECKOUT_BUTTON_TEXT)
+            or any(pattern.search(self._text(control)) for pattern in SUCCESS_PATTERNS)
+            or BARE_CLOCKED_PATTERN.fullmatch(self._text(control))
         ]
-        for title in title_controls:
-            current = title
+        for anchor in anchor_controls:
+            current = anchor
             for _ in range(8):
                 try:
                     current = current.parent()
-                    if current.element_info.control_type == "Window":
-                        break
                     descendants = current.descendants()
                 except Exception:
                     break
@@ -287,16 +382,19 @@ class FeishuUiaAdapter:
                 texts.extend(
                     text for control in descendants if (text := self._text(control))
                 )
+                window_title = self._text(window)
+                if window_title and window_title not in texts:
+                    texts.append(window_title)
                 page_date = self._extract_page_date(texts, day.year)
                 if page_date != day:
                     continue
-                if not any("上班打卡" in text for text in texts):
+                if not self._has_attendance_structure(texts):
                     continue
                 raw_buttons = self._checkout_buttons(current, descendants)
                 buttons = self._deduplicate_controls(raw_buttons, window)
                 if buttons is None:
                     continue
-                has_success = any(
+                has_success = self._has_independent_checkout_record(texts) or any(
                     pattern.search(text)
                     for pattern in SUCCESS_PATTERNS
                     for text in texts
@@ -330,13 +428,15 @@ class FeishuUiaAdapter:
                 break
         return next(iter(candidates.values())) if len(candidates) == 1 else None
 
-    def _checkout_buttons(self, window, descendants: Iterable[object] | None = None) -> list[object]:
+    def _checkout_buttons(
+        self, window, descendants: Iterable[object] | None = None
+    ) -> list[object]:
         controls = descendants if descendants is not None else window.descendants()
         matches = []
         for control in controls:
             try:
                 if (
-                    control.element_info.control_type == "Button"
+                    control.element_info.control_type in {"Button", "Text"}
                     and self._text(control) == CHECKOUT_BUTTON_TEXT
                 ):
                     matches.append(control)
@@ -369,7 +469,9 @@ class FeishuUiaAdapter:
         check_in_time: time | None = None
         blocking_reason: str | None = None
         try:
-            check_in_time = parse_unique_check_in_time(texts)
+            check_in_time = parse_unique_check_in_time(
+                self._check_in_source_texts(texts)
+            )
         except ValueError as exc:
             blocking_reason = str(exc)
 
@@ -378,7 +480,7 @@ class FeishuUiaAdapter:
                 blocking_reason = f"页面提示：{message}"
                 break
 
-        already_clocked_out = any(
+        already_clocked_out = self._has_independent_checkout_record(texts) or any(
             pattern.search(text) for pattern in SUCCESS_PATTERNS for text in texts
         )
         enabled = False
@@ -389,7 +491,7 @@ class FeishuUiaAdapter:
                 enabled = False
 
         page_date = self._extract_page_date(texts, day.year)
-        if "考勤打卡" not in texts or page_date != day:
+        if not self._has_attendance_marker(texts) or page_date != day:
             blocking_reason = "未确认当前页面为今天的考勤打卡页"
 
         signature_parts = (
@@ -425,8 +527,9 @@ class FeishuUiaAdapter:
     @staticmethod
     def _extract_page_date(texts: Iterable[str], default_year: int) -> date | None:
         patterns = (
-            re.compile(r"(?<!\d)(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?"),
-            re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日"),
+            re.compile(r"(?<!\d)(\d{4})([-/.])(\d{1,2})\2(\d{1,2})日?(?!\d)"),
+            re.compile(r"(?<!\d)(\d{4})年(\d{1,2})月(\d{1,2})日(?!\d)"),
+            re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)"),
         )
         candidates: set[date] = set()
         for text_value in texts:
@@ -435,7 +538,19 @@ class FeishuUiaAdapter:
                     try:
                         if index == 0:
                             candidates.add(
-                                date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                                date(
+                                    int(match.group(1)),
+                                    int(match.group(3)),
+                                    int(match.group(4)),
+                                )
+                            )
+                        elif index == 1:
+                            candidates.add(
+                                date(
+                                    int(match.group(1)),
+                                    int(match.group(2)),
+                                    int(match.group(3)),
+                                )
                             )
                         else:
                             candidates.add(
@@ -444,6 +559,72 @@ class FeishuUiaAdapter:
                     except ValueError:
                         return None
         return next(iter(candidates)) if len(candidates) == 1 else None
+
+    @staticmethod
+    def _has_attendance_marker(texts: Iterable[str]) -> bool:
+        return any(text in ATTENDANCE_PAGE_NAMES for text in texts)
+
+    @staticmethod
+    def _has_attendance_structure(texts: Iterable[str]) -> bool:
+        values = list(texts)
+        if "考勤打卡" in values:
+            return any("上班打卡" in text for text in values)
+        if "假勤" in values:
+            bounds = FeishuUiaAdapter._independent_section_bounds(values)
+            return bounds is not None
+        return False
+
+    @staticmethod
+    def _independent_section_bounds(texts: list[str]) -> tuple[int, int] | None:
+        check_in_headers = [
+            index for index, text in enumerate(texts) if text.startswith("应上班")
+        ]
+        check_out_headers = [
+            index for index, text in enumerate(texts) if text.startswith("应下班")
+        ]
+        if len(check_in_headers) != 1 or len(check_out_headers) != 1:
+            return None
+        start, end = check_in_headers[0], check_out_headers[0]
+        return (start, end) if start < end else None
+
+    @classmethod
+    def _check_in_source_texts(cls, texts: list[str]) -> list[str]:
+        if "假勤" not in texts:
+            return texts
+        bounds = cls._independent_section_bounds(texts)
+        if bounds is None:
+            return texts
+        start, end = bounds
+        normalized = list(texts)
+        for text in texts[start + 1 : end]:
+            match = BARE_CLOCKED_PATTERN.fullmatch(text)
+            if match is not None:
+                normalized.append(f"上班已打卡 {match.group(1)}")
+        return normalized
+
+    @classmethod
+    def _has_independent_checkout_record(cls, texts: list[str]) -> bool:
+        if "假勤" not in texts:
+            return False
+        bounds = cls._independent_section_bounds(texts)
+        if bounds is None:
+            return False
+        _, end = bounds
+        return any(
+            BARE_CLOCKED_PATTERN.fullmatch(text) is not None
+            for text in texts[end + 1 :]
+        )
+
+    @staticmethod
+    def _invoke_checkout_control(control) -> None:
+        control_type = control.element_info.control_type
+        if control_type == "Button":
+            control.invoke()
+            return
+        if control_type == "Text":
+            control.click_input()
+            return
+        raise RuntimeError("下班打卡控件类型不受支持")
 
     @classmethod
     def _persistent_path(cls, control, root) -> str:

@@ -35,6 +35,7 @@ def test_same_time_from_multiple_sources_is_not_ambiguous() -> None:
     [
         [],
         ["更新时间 09:03"],
+        ["已打卡 09:03"],
         ["上班打卡 09:03", "上班打卡 09:04"],
         ["上班打卡 24:00"],
     ],
