@@ -61,6 +61,12 @@ class _AttendanceContext:
     button_runtime_id: tuple[object, ...]
 
 
+class ClockoutClickError(RuntimeError):
+    def __init__(self, message: str, *, invocation_started: bool) -> None:
+        super().__init__(message)
+        self.invocation_started = invocation_started
+
+
 class FeishuUiaAdapter:
     """Strict UIA adapter: ambiguous controls always produce a blocked snapshot."""
 
@@ -132,6 +138,7 @@ class FeishuUiaAdapter:
     def click_clock_out(self, expected_signature: str) -> None:
         with self._com_scope():
             window = None
+            invocation_started = False
             try:
                 window, button = self._confirmed_checkout_target(expected_signature)
                 if window.is_minimized():
@@ -150,13 +157,17 @@ class FeishuUiaAdapter:
                     if not is_interactive_desktop():
                         raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
                 self._clear_pending_button(keep_restore=True)
+                invocation_started = True
                 self._invoke_checkout_control(button)
             except Exception as exc:
                 if window is not None:
                     self._restore_window(window)
                 else:
                     self._restore_after_action = False
-                raise RuntimeError("下班打卡按钮无法安全调用") from exc
+                raise ClockoutClickError(
+                    f"下班打卡按钮无法安全调用：{exc}",
+                    invocation_started=invocation_started,
+                ) from exc
 
     def _confirmed_checkout_target(
         self, expected_signature: str

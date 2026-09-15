@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Callable, Protocol
@@ -13,6 +14,9 @@ from .core import (
     snapshots_match,
 )
 from .storage import JsonStateStore
+
+
+LOGGER = logging.getLogger("clockout-demo")
 
 
 class AttendanceAdapter(Protocol):
@@ -243,11 +247,18 @@ class ClockoutEngine:
 
         try:
             self.adapter.click_clock_out(second.signature)
-        except Exception:
-            self._record_outcome(day, "click_failed", success=False)
+        except Exception as exc:
+            invocation_started = bool(getattr(exc, "invocation_started", True))
+            outcome = "click_failed" if invocation_started else "aborted_before_click"
+            self._record_outcome(day, outcome, success=False)
+            LOGGER.exception("下班打卡点击异常（已开始调用：%s）", invocation_started)
             return CheckResult(
                 "unknown",
-                "点击未完成，今天不会自动重试",
+                (
+                    "点击调用失败，结果不明确，今天不会自动重试"
+                    if invocation_started
+                    else "点击前安全检查未通过，今天不会自动重试"
+                ),
                 first.check_in_time,
                 eligible_time,
             )

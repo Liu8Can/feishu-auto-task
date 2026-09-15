@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import clockout.feishu_uia as feishu_uia
-from clockout.feishu_uia import FeishuUiaAdapter
+from clockout.feishu_uia import ClockoutClickError, FeishuUiaAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -610,8 +610,9 @@ def test_text_click_is_blocked_when_window_activation_fails(
 
     root.set_focus = fail_focus  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ClockoutClickError) as error:
         adapter.click_clock_out(signature)
+    assert not error.value.invocation_started
     assert target.click_input_count == 0
 
 
@@ -666,6 +667,28 @@ def test_text_click_succeeds_only_after_all_final_checks(
     assert root.focus_count == 1
     assert target.click_input_count == 1
     assert target.invoke_count == 0
+
+
+def test_text_click_reports_when_physical_invocation_has_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, root, target, signature = _prepare_text_click(monkeypatch)
+    desktop = SimpleNamespace(from_point=lambda x, y: target)
+    monkeypatch.setattr(feishu_uia, "Desktop", lambda **kwargs: desktop)
+    monkeypatch.setattr(
+        feishu_uia.win32gui, "GetForegroundWindow", lambda: root.handle
+    )
+
+    def fail_click() -> None:
+        raise RuntimeError("physical click failed")
+
+    target.click_input = fail_click  # type: ignore[method-assign]
+
+    with pytest.raises(ClockoutClickError) as error:
+        adapter.click_clock_out(signature)
+
+    assert error.value.invocation_started
+    assert "physical click failed" in str(error.value)
 
 
 def test_text_click_revalidates_runtime_identity_after_activation(

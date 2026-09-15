@@ -316,6 +316,30 @@ def test_click_exception_is_never_retried_that_day(tmp_path: object) -> None:
     assert adapter.click_calls == 1
 
 
+def test_preclick_exception_records_distinct_outcome(tmp_path: object) -> None:
+    class PreclickError(RuntimeError):
+        invocation_started = False
+
+    now = datetime(2026, 9, 15, 17, 5)
+    snapshot = valid_snapshot()
+    adapter = FakeAdapter([snapshot, snapshot], now=now)
+
+    def fail_before_click(expected_signature: str) -> None:
+        adapter.click_calls += 1
+        raise PreclickError("foreground changed")
+
+    adapter.click_clock_out = fail_before_click  # type: ignore[method-assign]
+    engine, store = make_engine(tmp_path, adapter, mode="automatic")
+
+    result = engine.check(now)
+    state = store.load(now.date())
+
+    assert result.status == "unknown"
+    assert "点击前安全检查未通过" in result.message
+    assert state is not None
+    assert state.outcome == "aborted_before_click"
+
+
 def test_automatic_mode_requires_interactive_session_before_first_snapshot(
     tmp_path: object,
 ) -> None:
