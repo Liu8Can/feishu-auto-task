@@ -26,18 +26,45 @@ class AppConfig:
     weekdays: tuple[int, ...] = (0, 1, 2, 3, 4)
     auto_open_workbench: bool = True
     trusted_container_fingerprint: str = ""
+    calculation_mode: str = "dynamic"
+    break_start_time: str = "12:00"
+    break_end_time: str = "14:00"
+    fixed_checkin_time: str = "08:50"
+    fixed_clockout_time: str = "18:50"
 
     def validate(self) -> AppConfig:
-        if not 1 <= self.work_duration_minutes <= 24 * 60:
+        if self.calculation_mode not in {"dynamic", "fixed"}:
+            raise ValueError("下班时间计算模式只能是 dynamic 或 fixed")
+        if (
+            isinstance(self.work_duration_minutes, bool)
+            or not isinstance(self.work_duration_minutes, int)
+            or not 1 <= self.work_duration_minutes <= 24 * 60
+        ):
             raise ValueError("工作时长必须在 1 到 1440 分钟之间")
-        if not 0 <= self.buffer_minutes <= 180:
+        if (
+            isinstance(self.buffer_minutes, bool)
+            or not isinstance(self.buffer_minutes, int)
+            or not 0 <= self.buffer_minutes <= 180
+        ):
             raise ValueError("安全缓冲必须在 0 到 180 分钟之间")
-        if not 1 <= self.check_interval_minutes <= 60:
+        if (
+            isinstance(self.check_interval_minutes, bool)
+            or not isinstance(self.check_interval_minutes, int)
+            or not 1 <= self.check_interval_minutes <= 60
+        ):
             raise ValueError("检查间隔必须在 1 到 60 分钟之间")
         start = _parse_time(self.check_start_time)
         end = _parse_time(self.check_end_time)
         if start > end:
             raise ValueError("第一版不支持跨自然日的检查时间窗")
+        break_start = _parse_time(self.break_start_time)
+        break_end = _parse_time(self.break_end_time)
+        if break_start >= break_end:
+            raise ValueError("休息开始时间必须早于休息结束时间")
+        fixed_checkin = _parse_time(self.fixed_checkin_time)
+        fixed_clockout = _parse_time(self.fixed_clockout_time)
+        if fixed_checkin >= fixed_clockout:
+            raise ValueError("固定上班时间必须早于固定下班时间")
         if self.mode not in {"dry_run", "automatic"}:
             raise ValueError("运行模式只能是 dry_run 或 automatic")
         if not self.weekdays or any(day not in range(7) for day in self.weekdays):
@@ -51,6 +78,22 @@ class AppConfig:
     @property
     def end_time(self) -> time:
         return _parse_time(self.check_end_time)
+
+    @property
+    def break_start(self) -> time:
+        return _parse_time(self.break_start_time)
+
+    @property
+    def break_end(self) -> time:
+        return _parse_time(self.break_end_time)
+
+    @property
+    def fixed_checkin(self) -> time:
+        return _parse_time(self.fixed_checkin_time)
+
+    @property
+    def fixed_clockout(self) -> time:
+        return _parse_time(self.fixed_clockout_time)
 
     def with_mode(self, mode: str) -> AppConfig:
         return replace(self, mode=mode).validate()

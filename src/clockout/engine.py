@@ -35,14 +35,47 @@ class EngineConfig:
     weekdays: frozenset[int] = frozenset({0, 1, 2, 3, 4})
     extra_workdays: frozenset[date] = frozenset()
     excluded_dates: frozenset[date] = frozenset()
+    calculation_mode: str = "dynamic"
+    break_start_time: time = time(12, 0)
+    break_end_time: time = time(14, 0)
+    fixed_checkin_time: time = time(8, 50)
+    fixed_clockout_time: time = time(18, 50)
 
     def __post_init__(self) -> None:
         if self.mode not in {"automatic", "dry_run"}:
             raise ValueError("mode 只能是 automatic 或 dry_run")
-        if self.work_duration_minutes < 0 or self.safety_buffer_minutes < 0:
-            raise ValueError("工作时长和安全缓冲不能为负数")
+        if self.calculation_mode not in {"dynamic", "fixed"}:
+            raise ValueError("calculation_mode 只能是 dynamic 或 fixed")
+        if (
+            isinstance(self.work_duration_minutes, bool)
+            or not isinstance(self.work_duration_minutes, int)
+            or not 1 <= self.work_duration_minutes <= 24 * 60
+        ):
+            raise ValueError("工作时长必须在 1 到 1440 分钟之间")
+        if (
+            isinstance(self.safety_buffer_minutes, bool)
+            or not isinstance(self.safety_buffer_minutes, int)
+            or not 0 <= self.safety_buffer_minutes <= 180
+        ):
+            raise ValueError("安全缓冲必须在 0 到 180 分钟之间")
+        if not all(
+            isinstance(value, time)
+            for value in (
+                self.break_start_time,
+                self.break_end_time,
+                self.fixed_checkin_time,
+                self.fixed_clockout_time,
+                self.check_start_time,
+                self.check_end_time,
+            )
+        ):
+            raise ValueError("作息和检查时间必须是有效时间")
         if self.check_start_time > self.check_end_time:
             raise ValueError("第一版不支持跨自然日的检查时间窗")
+        if self.break_start_time >= self.break_end_time:
+            raise ValueError("休息开始时间必须早于休息结束时间")
+        if self.fixed_checkin_time >= self.fixed_clockout_time:
+            raise ValueError("固定上班时间必须早于固定下班时间")
         if not self.weekdays or any(day not in range(7) for day in self.weekdays):
             raise ValueError("工作日配置无效")
 
@@ -92,12 +125,14 @@ class ClockoutEngine:
         if precheck is not None:
             return precheck
 
-        eligible_time = calculate_eligible_time(
-            day,
-            first.check_in_time,
-            self.config.work_duration_minutes,
-            self.config.safety_buffer_minutes,
-        )
+        eligible_time = self._calculate_eligible_time(day, first.check_in_time)
+        if eligible_time > datetime.combine(day, self.config.check_end_time):
+            return CheckResult(
+                "blocked",
+                "目标下班时间晚于检查结束时间，请调整作息或检查时间范围",
+                first.check_in_time,
+                eligible_time,
+            )
         if now < eligible_time:
             return CheckResult(
                 "waiting",
@@ -284,11 +319,8 @@ class ClockoutEngine:
             return CheckResult("blocked", "未确认当前页面属于今天")
         if snapshot.check_in_time is None:
             return CheckResult("blocked", "未识别到唯一的上班打卡时间")
-        eligible_time = calculate_eligible_time(
-            now.date(),
-            snapshot.check_in_time,
-            self.config.work_duration_minutes,
-            self.config.safety_buffer_minutes,
+        eligible_time = self._calculate_eligible_time(
+            now.date(), snapshot.check_in_time
         )
         if snapshot.already_clocked_out:
             return CheckResult(
@@ -326,3 +358,18 @@ class ClockoutEngine:
                 eligible_time,
             )
         return None
+
+    def _calculate_eligible_time(
+        self, day: date, check_in_time: time
+    ) -> datetime:
+        return calculate_eligible_time(
+            day,
+            check_in_time,
+            self.config.work_duration_minutes,
+            self.config.safety_buffer_minutes,
+            calculation_mode=self.config.calculation_mode,
+            break_start_time=self.config.break_start_time,
+            break_end_time=self.config.break_end_time,
+            fixed_checkin_time=self.config.fixed_checkin_time,
+            fixed_clockout_time=self.config.fixed_clockout_time,
+        )

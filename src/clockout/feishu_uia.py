@@ -24,7 +24,8 @@ FEISHU_WINDOW_TITLES = ("飞书", "假勤")
 ATTENDANCE_PAGE_NAMES = ("考勤打卡", "假勤")
 BARE_CLOCKED_PATTERN = re.compile(r"^已打卡\s*[:：]?\s*(\d{1,2}:\d{2})$")
 WORKBENCH_URI = "lark://appcenter.open"
-ATTENDANCE_ENTRY_NAMES = ("考勤打卡", "考勤")
+ATTENDANCE_ENTRY_NAMES = ("假勤", "考勤打卡", "考勤")
+NAVIGATION_POLL_INTERVAL = 0.2
 SUCCESS_PATTERNS = (
     re.compile(r"下班已打卡(?:\s*\d{1,2}:\d{2})?"),
     re.compile(r"下班打卡成功"),
@@ -83,17 +84,7 @@ class FeishuUiaAdapter:
         self._clear_pending_button()
         if not self.trusted_container_fingerprint:
             return self._blocked("尚未绑定当前飞书考勤页面")
-        page = self._attendance_page(day, require_trusted=True)
-        if page is None and self.auto_open_workbench:
-            self.open_workbench()
-            time_module.sleep(self.navigation_wait)
-            page = self._attendance_page(day, require_trusted=True)
-            if page is None:
-                window = self._main_window()
-                if window is not None:
-                    self._open_attendance_entry(window)
-                    time_module.sleep(self.navigation_wait)
-                    page = self._attendance_page(day, require_trusted=True)
+        page = self._find_or_open_attendance_page(day, require_trusted=True)
         if page is None:
             return self._blocked("未确认当前页面为今天的考勤打卡页")
 
@@ -287,6 +278,20 @@ class FeishuUiaAdapter:
     def open_workbench(self) -> None:
         os.startfile(WORKBENCH_URI)
 
+    def open_attendance_page(self, day: date) -> bool:
+        """Open and confirm today's unique attendance page without binding it."""
+        with self._com_scope():
+            if not is_interactive_desktop():
+                raise RuntimeError("Windows 当前不是可交互桌面会话")
+            page = self._find_or_open_attendance_page(
+                day,
+                require_trusted=bool(self.trusted_container_fingerprint),
+                allow_navigation=True,
+            )
+            if page is None:
+                return False
+            return self._show_window(page[0])
+
     def diagnostics(self) -> dict[str, object]:
         with self._com_scope():
             windows = self._feishu_windows()
@@ -311,7 +316,7 @@ class FeishuUiaAdapter:
         with self._com_scope():
             if not is_interactive_desktop():
                 raise RuntimeError("Windows 当前不是可交互桌面会话")
-            page = self._attendance_page(day, require_trusted=False)
+            page = self._find_or_open_attendance_page(day, require_trusted=False)
             if page is None:
                 raise RuntimeError("当前页面不是可唯一确认的今日考勤页")
             window, context = page
@@ -323,6 +328,77 @@ class FeishuUiaAdapter:
                 raise RuntimeError("当前页面不是可唯一确认的今日考勤页")
             self.trusted_container_fingerprint = context.container_id
             return context.container_id
+
+    def _find_or_open_attendance_page(
+        self,
+        day: date,
+        *,
+        require_trusted: bool,
+        allow_navigation: bool | None = None,
+    ) -> tuple[object, _AttendanceContext] | None:
+        page = self._attendance_page(day, require_trusted=require_trusted)
+        navigation_enabled = (
+            self.auto_open_workbench
+            if allow_navigation is None
+            else allow_navigation
+        )
+        if page is not None or not navigation_enabled:
+            return page
+
+        try:
+            self.open_workbench()
+        except OSError:
+            return None
+
+        state = self._wait_until(
+            lambda: self._attendance_page_or_ready_main_window(
+                day, require_trusted=require_trusted
+            )
+        )
+        if state is None:
+            return None
+        kind, value = state
+        if kind == "page":
+            return value
+        if not self._show_window(value):
+            return None
+        if not self._open_attendance_entry(value):
+            return None
+        return self._wait_until(
+            lambda: self._attendance_page(day, require_trusted=require_trusted)
+        )
+
+    def _attendance_page_or_ready_main_window(
+        self, day: date, *, require_trusted: bool
+    ) -> tuple[str, object] | None:
+        page = self._attendance_page(day, require_trusted=require_trusted)
+        if page is not None:
+            return "page", page
+        window = self._main_window()
+        if window is not None and self._attendance_entry(window) is not None:
+            return "window", window
+        return None
+
+    def _wait_until(self, finder):
+        deadline = time_module.monotonic() + max(0.0, self.navigation_wait)
+        while True:
+            result = finder()
+            if result is not None:
+                return result
+            remaining = deadline - time_module.monotonic()
+            if remaining <= 0:
+                return None
+            time_module.sleep(min(NAVIGATION_POLL_INTERVAL, remaining))
+
+    @staticmethod
+    def _show_window(window) -> bool:
+        try:
+            if window.is_minimized():
+                window.restore()
+            window.set_focus()
+        except Exception:
+            return False
+        return True
 
     def _main_window(self):
         candidates = [
@@ -444,18 +520,33 @@ class FeishuUiaAdapter:
                 continue
         return matches
 
-    def _open_attendance_entry(self, window) -> None:
+    def _open_attendance_entry(self, window) -> bool:
+        entry = self._attendance_entry(window)
+        if entry is None:
+            return False
+        try:
+            entry.invoke()
+        except Exception:
+            return False
+        return True
+
+    def _attendance_entry(self, window):
         matches = []
         for control in window.descendants():
-            text = self._text(control)
-            if text in ATTENDANCE_ENTRY_NAMES and control.is_visible() and control.is_enabled():
-                matches.append(control)
-        if len(matches) != 1:
-            return
-        try:
-            matches[0].invoke()
-        except Exception:
-            return
+            try:
+                text = self._text(control)
+                if (
+                    text in ATTENDANCE_ENTRY_NAMES
+                    and control.is_visible()
+                    and control.is_enabled()
+                ):
+                    matches.append(control)
+            except Exception:
+                continue
+        unique_matches = self._deduplicate_controls(matches, window)
+        if unique_matches is None or len(unique_matches) != 1:
+            return None
+        return unique_matches[0]
 
     def _build_snapshot(
         self,

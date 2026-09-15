@@ -49,8 +49,71 @@ def test_missing_ambiguous_or_invalid_check_in_time_is_rejected(
 
 def test_calculate_dynamic_eligible_time() -> None:
     assert calculate_eligible_time(date(2026, 9, 15), time(9, 0)) == datetime(
-        2026, 9, 15, 17, 5
+        2026, 9, 15, 19, 5
     )
+
+
+@pytest.mark.parametrize(
+    ("check_in", "duration", "expected"),
+    [
+        (time(11, 0), 120, datetime(2026, 9, 15, 15, 5)),
+        (time(13, 0), 60, datetime(2026, 9, 15, 15, 5)),
+        (time(14, 0), 480, datetime(2026, 9, 15, 22, 5)),
+        (time(8, 0), 240, datetime(2026, 9, 15, 12, 5)),
+    ],
+)
+def test_dynamic_time_excludes_only_overlapping_break_minutes(
+    check_in: time, duration: int, expected: datetime
+) -> None:
+    assert (
+        calculate_eligible_time(
+            date(2026, 9, 15),
+            check_in,
+            work_duration_minutes=duration,
+        )
+        == expected
+    )
+
+
+def test_fixed_time_uses_planned_clockout_for_early_check_in() -> None:
+    assert calculate_eligible_time(
+        date(2026, 9, 15),
+        time(8, 40),
+        work_duration_minutes=1,
+        safety_buffer_minutes=180,
+        calculation_mode="fixed",
+        break_start_time=time(1, 0),
+        break_end_time=time(23, 0),
+        fixed_checkin_time=time(8, 50),
+        fixed_clockout_time=time(18, 50),
+    ) == datetime(2026, 9, 15, 18, 50)
+
+
+def test_fixed_time_delays_clockout_when_actual_check_in_is_late() -> None:
+    assert calculate_eligible_time(
+        date(2026, 9, 15),
+        time(9, 10),
+        calculation_mode="fixed",
+        fixed_checkin_time=time(8, 50),
+        fixed_clockout_time=time(18, 50),
+    ) == datetime(2026, 9, 15, 19, 10)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"calculation_mode": "other"},
+        {"break_start_time": time(14), "break_end_time": time(12)},
+        {"fixed_checkin_time": time(18, 50), "fixed_clockout_time": time(18, 50)},
+    ],
+)
+def test_invalid_eligible_time_options_are_rejected(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        calculate_eligible_time(
+            date(2026, 9, 15), time(9), **changes  # type: ignore[arg-type]
+        )
 
 
 def test_workday_overrides_are_deterministic() -> None:

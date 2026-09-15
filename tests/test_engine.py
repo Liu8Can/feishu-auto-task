@@ -88,7 +88,11 @@ def make_engine(
     provider = now_provider or (
         lambda: adapter.now or datetime(2026, 9, 15, 17, 5)
     )
-    config = EngineConfig(mode=mode, weekdays=weekdays)
+    config = EngineConfig(
+        mode=mode,
+        weekdays=weekdays,
+        work_duration_minutes=360,
+    )
     return ClockoutEngine(adapter, store, config, now_provider=provider), store
 
 
@@ -102,6 +106,85 @@ def test_before_dynamic_target_waits_without_clicking(tmp_path: object) -> None:
     assert result.eligible_time == datetime(2026, 9, 15, 17, 5)
     assert adapter.click_calls == 0
     assert store.load(datetime(2026, 9, 15).date()) is None
+
+
+def test_default_dynamic_target_excludes_two_hour_break(tmp_path: object) -> None:
+    adapter = FakeAdapter([valid_snapshot()])
+    store = JsonStateStore(tmp_path / "state.json")  # type: ignore[operator]
+    engine = ClockoutEngine(adapter, store, EngineConfig())
+
+    result = engine.check(datetime(2026, 9, 15, 19, 4))
+
+    assert result.status == "waiting"
+    assert result.eligible_time == datetime(2026, 9, 15, 19, 5)
+    assert adapter.click_calls == 0
+
+
+def test_fixed_mode_uses_configured_clockout_but_requires_check_in(
+    tmp_path: object,
+) -> None:
+    config = EngineConfig(
+        calculation_mode="fixed",
+        work_duration_minutes=1,
+        safety_buffer_minutes=180,
+        break_start_time=time(1),
+        break_end_time=time(23),
+        fixed_checkin_time=time(8, 50),
+        fixed_clockout_time=time(18, 50),
+    )
+    store = JsonStateStore(tmp_path / "state.json")  # type: ignore[operator]
+    adapter = FakeAdapter([valid_snapshot()])
+    result = ClockoutEngine(adapter, store, config).check(
+        datetime(2026, 9, 15, 19, 0)
+    )
+
+    assert result.status == "dry_run_ready"
+    assert result.eligible_time == datetime(2026, 9, 15, 19, 0)
+    assert adapter.click_calls == 0
+
+    missing_store = JsonStateStore(tmp_path / "missing.json")  # type: ignore[operator]
+    missing_adapter = FakeAdapter([valid_snapshot(check_in_time=None)])
+    missing_result = ClockoutEngine(missing_adapter, missing_store, config).check(
+        datetime(2026, 9, 15, 19, 0)
+    )
+    assert missing_result.status == "blocked"
+    assert missing_adapter.click_calls == 0
+
+
+def test_target_after_check_end_is_blocked_without_clicking(tmp_path: object) -> None:
+    snapshot = valid_snapshot(check_in_time=time(16, 0))
+    adapter = FakeAdapter([snapshot], interactive_results=[True])
+    store = JsonStateStore(tmp_path / "state.json")  # type: ignore[operator]
+    engine = ClockoutEngine(
+        adapter,
+        store,
+        EngineConfig(mode="automatic"),
+    )
+
+    result = engine.check(datetime(2026, 9, 15, 17, 0))
+
+    assert result.status == "blocked"
+    assert "晚于检查结束时间" in result.message
+    assert result.eligible_time == datetime(2026, 9, 16, 0, 5)
+    assert adapter.click_calls == 0
+    assert store.load(datetime(2026, 9, 15).date()) is None
+
+
+def test_engine_config_rejects_invalid_schedule() -> None:
+    for changes in (
+        {"calculation_mode": "other"},
+        {"work_duration_minutes": 0},
+        {"work_duration_minutes": "480"},
+        {"safety_buffer_minutes": 181},
+        {"check_start_time": "15:00"},
+        {"break_start_time": time(14), "break_end_time": time(12)},
+        {"fixed_checkin_time": time(18, 50), "fixed_clockout_time": time(18, 50)},
+    ):
+        try:
+            EngineConfig(**changes)  # type: ignore[arg-type]
+        except ValueError:
+            continue
+        raise AssertionError(f"未拒绝无效配置：{changes}")
 
 
 def test_dry_run_at_target_is_strictly_zero_click(tmp_path: object) -> None:
@@ -278,7 +361,7 @@ def test_final_time_change_blocks_before_claim_or_click(tmp_path: object) -> Non
         engine = ClockoutEngine(
             adapter,
             store,
-            EngineConfig(mode="automatic"),
+            EngineConfig(mode="automatic", work_duration_minutes=360),
             now_provider=lambda value=final_time: value,
         )
 

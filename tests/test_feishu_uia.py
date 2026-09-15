@@ -60,6 +60,8 @@ class FakeControl:
         self.invoke_count = 0
         self.click_input_count = 0
         self.focus_count = 0
+        self.minimized = False
+        self.restore_count = 0
         if parent is not None:
             parent._children.append(self)
 
@@ -96,13 +98,39 @@ class FakeControl:
         self.click_input_count += 1
 
     def is_minimized(self) -> bool:
-        return False
+        return self.minimized
+
+    def restore(self) -> None:
+        self.minimized = False
+        self.restore_count += 1
 
     def set_focus(self) -> None:
         self.focus_count += 1
 
     def rectangle(self):
         return SimpleNamespace(left=10, top=10, right=110, bottom=50)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+
+    def monotonic(self) -> float:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.current += seconds
+
+
+def _fake_attendance_context(container_id: str = "attendance-container"):
+    return feishu_uia._AttendanceContext(
+        texts=["考勤打卡", "9月15日", "上班打卡 09:03", "下班打卡"],
+        buttons=[],
+        container_id=container_id,
+        button_id="",
+        container_runtime_id=(100, 200, 10),
+        button_runtime_id=(),
+    )
 
 
 def _add_attendance_container(
@@ -116,6 +144,225 @@ def _add_attendance_container(
         "Button", (base_runtime_id + 4,), text="下班打卡", parent=container
     )
     return container, button
+
+
+def test_navigation_reuses_attendance_page_that_is_already_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True)
+    page = (FakeControl("Window", (1,), text="假勤"), _fake_attendance_context())
+    monkeypatch.setattr(adapter, "_attendance_page", lambda *args, **kwargs: page)
+    monkeypatch.setattr(
+        adapter,
+        "open_workbench",
+        lambda: pytest.fail("考勤页已打开时不应再次唤醒飞书"),
+    )
+
+    result = adapter._find_or_open_attendance_page(
+        date(2026, 9, 15), require_trusted=False
+    )
+
+    assert result is page
+
+
+def test_explicit_open_attendance_page_navigates_when_automatic_open_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False, navigation_wait=0)
+    main_window = FakeControl("Window", (1,), text="飞书")
+    entry = FakeControl("Button", (2,), text="考勤", parent=main_window)
+    page = (FakeControl("Window", (3,), text="假勤"), _fake_attendance_context())
+    wake_count = 0
+
+    def wake() -> None:
+        nonlocal wake_count
+        wake_count += 1
+
+    monkeypatch.setattr(feishu_uia, "is_interactive_desktop", lambda: True)
+    monkeypatch.setattr(adapter, "open_workbench", wake)
+    monkeypatch.setattr(
+        adapter,
+        "_attendance_page",
+        lambda *args, **kwargs: page if entry.invoke_count else None,
+    )
+    monkeypatch.setattr(adapter, "_main_window", lambda: main_window)
+
+    opened = adapter.open_attendance_page(date(2026, 9, 15))
+
+    assert opened
+    assert wake_count == 1
+    assert entry.invoke_count == 1
+    assert page[0].focus_count == 1
+
+
+def test_explicit_open_restores_and_focuses_existing_attendance_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True)
+    window = FakeControl("Window", (1,), text="假勤")
+    window.minimized = True
+    page = (window, _fake_attendance_context())
+
+    monkeypatch.setattr(feishu_uia, "is_interactive_desktop", lambda: True)
+    monkeypatch.setattr(adapter, "_attendance_page", lambda *args, **kwargs: page)
+
+    assert adapter.open_attendance_page(date(2026, 9, 15))
+    assert window.restore_count == 1
+    assert window.focus_count == 1
+
+
+def test_navigation_starts_feishu_waits_for_main_window_and_opens_unique_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True, navigation_wait=0.6)
+    clock = FakeClock()
+    main_window = FakeControl("Window", (1,), text="飞书")
+    entry = FakeControl("Button", (2,), text="假勤", parent=main_window)
+    page = (FakeControl("Window", (3,), text="假勤"), _fake_attendance_context())
+    wake_count = 0
+
+    def wake() -> None:
+        nonlocal wake_count
+        wake_count += 1
+
+    monkeypatch.setattr(feishu_uia.time_module, "monotonic", clock.monotonic)
+    monkeypatch.setattr(feishu_uia.time_module, "sleep", clock.sleep)
+    monkeypatch.setattr(adapter, "open_workbench", wake)
+    monkeypatch.setattr(
+        adapter,
+        "_attendance_page",
+        lambda *args, **kwargs: page if entry.invoke_count else None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_main_window",
+        lambda: main_window if clock.current >= 0.2 else None,
+    )
+
+    result = adapter._find_or_open_attendance_page(
+        date(2026, 9, 15), require_trusted=False
+    )
+
+    assert result is page
+    assert wake_count == 1
+    assert entry.invoke_count == 1
+
+
+def test_navigation_waits_for_attendance_entry_after_main_window_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True, navigation_wait=0.6)
+    clock = FakeClock()
+    main_window = FakeControl("Window", (1,), text="飞书")
+    entry = FakeControl("Button", (2,), text="假勤", parent=main_window)
+    page = (FakeControl("Window", (3,), text="假勤"), _fake_attendance_context())
+
+    monkeypatch.setattr(feishu_uia.time_module, "monotonic", clock.monotonic)
+    monkeypatch.setattr(feishu_uia.time_module, "sleep", clock.sleep)
+    monkeypatch.setattr(adapter, "open_workbench", lambda: None)
+    monkeypatch.setattr(
+        adapter,
+        "_attendance_page",
+        lambda *args, **kwargs: page if entry.invoke_count else None,
+    )
+    monkeypatch.setattr(adapter, "_main_window", lambda: main_window)
+    monkeypatch.setattr(
+        main_window,
+        "descendants",
+        lambda: [entry] if clock.current >= 0.2 else [],
+    )
+
+    result = adapter._find_or_open_attendance_page(
+        date(2026, 9, 15), require_trusted=False
+    )
+
+    assert result is page
+    assert clock.current == pytest.approx(0.2)
+    assert entry.invoke_count == 1
+
+
+def test_calibration_can_navigate_before_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True, navigation_wait=0)
+    main_window = FakeControl("Window", (1,), text="飞书")
+    entry = FakeControl("Button", (2,), text="考勤打卡", parent=main_window)
+    context = _fake_attendance_context("new-binding")
+    page = (FakeControl("Window", (3,), text="假勤"), context)
+    wake_count = 0
+
+    def wake() -> None:
+        nonlocal wake_count
+        wake_count += 1
+
+    monkeypatch.setattr(feishu_uia, "is_interactive_desktop", lambda: True)
+    monkeypatch.setattr(adapter, "open_workbench", wake)
+    monkeypatch.setattr(
+        adapter,
+        "_attendance_page",
+        lambda *args, **kwargs: page if entry.invoke_count else None,
+    )
+    monkeypatch.setattr(adapter, "_main_window", lambda: main_window)
+
+    fingerprint = adapter.calibrate_current_page(date(2026, 9, 15))
+
+    assert fingerprint == "new-binding"
+    assert adapter.trusted_container_fingerprint == "new-binding"
+    assert wake_count == 1
+    assert entry.invoke_count == 1
+
+
+def test_navigation_rejects_multiple_attendance_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True, navigation_wait=0)
+    main_window = FakeControl("Window", (1,), text="飞书")
+    first = FakeControl("Button", (2,), text="假勤", parent=main_window)
+    second = FakeControl("Button", (3,), text="考勤", parent=main_window)
+    wake_count = 0
+
+    def wake() -> None:
+        nonlocal wake_count
+        wake_count += 1
+
+    monkeypatch.setattr(adapter, "open_workbench", wake)
+    monkeypatch.setattr(adapter, "_attendance_page", lambda *args, **kwargs: None)
+    monkeypatch.setattr(adapter, "_main_window", lambda: main_window)
+
+    result = adapter._find_or_open_attendance_page(
+        date(2026, 9, 15), require_trusted=False
+    )
+
+    assert result is None
+    assert wake_count == 1
+    assert first.invoke_count == 0
+    assert second.invoke_count == 0
+
+
+def test_navigation_times_out_when_feishu_does_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=True, navigation_wait=0.5)
+    clock = FakeClock()
+    wake_count = 0
+
+    def wake() -> None:
+        nonlocal wake_count
+        wake_count += 1
+
+    monkeypatch.setattr(feishu_uia.time_module, "monotonic", clock.monotonic)
+    monkeypatch.setattr(feishu_uia.time_module, "sleep", clock.sleep)
+    monkeypatch.setattr(adapter, "open_workbench", wake)
+    monkeypatch.setattr(adapter, "_attendance_page", lambda *args, **kwargs: None)
+    monkeypatch.setattr(adapter, "_main_window", lambda: None)
+
+    result = adapter._find_or_open_attendance_page(
+        date(2026, 9, 15), require_trusted=False
+    )
+
+    assert result is None
+    assert wake_count == 1
+    assert clock.current == pytest.approx(0.5)
 
 
 def test_snapshot_extracts_unique_check_in_and_button() -> None:

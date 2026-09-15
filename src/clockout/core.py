@@ -71,12 +71,67 @@ def calculate_eligible_time(
     check_in_time: time,
     work_duration_minutes: int = 480,
     safety_buffer_minutes: int = 5,
+    *,
+    calculation_mode: str = "dynamic",
+    break_start_time: time = time(12, 0),
+    break_end_time: time = time(14, 0),
+    fixed_checkin_time: time = time(8, 50),
+    fixed_clockout_time: time = time(18, 50),
 ) -> datetime:
-    if work_duration_minutes < 0 or safety_buffer_minutes < 0:
+    if (
+        isinstance(work_duration_minutes, bool)
+        or not isinstance(work_duration_minutes, int)
+        or isinstance(safety_buffer_minutes, bool)
+        or not isinstance(safety_buffer_minutes, int)
+        or work_duration_minutes < 0
+        or safety_buffer_minutes < 0
+    ):
         raise ValueError("工作时长和安全缓冲不能为负数")
-    return datetime.combine(day, check_in_time) + timedelta(
-        minutes=work_duration_minutes + safety_buffer_minutes
-    )
+    if calculation_mode not in {"dynamic", "fixed"}:
+        raise ValueError("下班时间计算模式只能是 dynamic 或 fixed")
+    if not all(
+        isinstance(value, time)
+        for value in (
+            check_in_time,
+            break_start_time,
+            break_end_time,
+            fixed_checkin_time,
+            fixed_clockout_time,
+        )
+    ):
+        raise ValueError("打卡、休息和固定下班时间必须是有效时间")
+    if break_start_time >= break_end_time:
+        raise ValueError("休息开始时间必须早于休息结束时间")
+    if fixed_checkin_time >= fixed_clockout_time:
+        raise ValueError("固定上班时间必须早于固定下班时间")
+
+    if calculation_mode == "fixed":
+        planned_checkin = datetime.combine(day, fixed_checkin_time)
+        actual_checkin = datetime.combine(day, check_in_time)
+        delay = max(timedelta(), actual_checkin - planned_checkin)
+        return datetime.combine(day, fixed_clockout_time) + delay
+
+    cursor = datetime.combine(day, check_in_time)
+    break_start = datetime.combine(day, break_start_time)
+    break_end = datetime.combine(day, break_end_time)
+    remaining = timedelta(minutes=work_duration_minutes)
+
+    if not remaining:
+        return cursor + timedelta(minutes=safety_buffer_minutes)
+
+    if cursor < break_end:
+        if cursor < break_start:
+            work_before_break = break_start - cursor
+            if remaining <= work_before_break:
+                cursor += remaining
+                remaining = timedelta()
+            else:
+                remaining -= work_before_break
+                cursor = break_end
+        else:
+            cursor = break_end
+
+    return cursor + remaining + timedelta(minutes=safety_buffer_minutes)
 
 
 def is_workday(
