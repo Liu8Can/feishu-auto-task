@@ -36,8 +36,12 @@ class ClockoutDemoApp:
         self.project_root = project_root
         self.config_path = project_root / "config" / "config.json"
         self.config: AppConfig = load_config(self.config_path)
+        if self.config.mode == "automatic" and not self.config.trusted_container_fingerprint:
+            self.config = self.config.with_mode("dry_run")
+            save_config(self.config_path, self.config)
         self.adapter = FeishuUiaAdapter(
-            auto_open_workbench=self.config.auto_open_workbench
+            auto_open_workbench=self.config.auto_open_workbench,
+            trusted_container_fingerprint=self.config.trusted_container_fingerprint,
         )
         self.store = JsonStateStore(project_root / "data" / "state.json")
         self.logger = self._setup_logger(project_root / "logs")
@@ -48,7 +52,7 @@ class ClockoutDemoApp:
 
         self.mode_var = tk.StringVar(value=self.config.mode)
         self.status_var = tk.StringVar(value=STATUS_LABELS["idle"])
-        self.message_var = tk.StringVar(value="请先在飞书打开考勤页，再进行诊断或检查")
+        self.message_var = tk.StringVar(value="请先在飞书打开今天的考勤页并完成页面绑定")
         self.check_in_var = tk.StringVar(value="--:--")
         self.eligible_var = tk.StringVar(value="--:--")
         self.next_check_var = tk.StringVar(value="未启动")
@@ -182,6 +186,9 @@ class ClockoutDemoApp:
         ttk.Button(actions, text="立即检查", command=self._run_check).pack(
             side="left", padx=(0, 8)
         )
+        ttk.Button(actions, text="绑定考勤页", command=self._run_calibration).pack(
+            side="left", padx=(0, 8)
+        )
         ttk.Button(actions, text="诊断当前页面", command=self._run_diagnostics).pack(
             side="left", padx=(0, 8)
         )
@@ -234,6 +241,14 @@ class ClockoutDemoApp:
     def _change_mode(self) -> None:
         requested = self.mode_var.get()
         if requested == "automatic":
+            if not self.config.trusted_container_fingerprint:
+                messagebox.showwarning(
+                    "尚未绑定考勤页",
+                    "请先打开今天的飞书考勤页并点击“绑定考勤页”。",
+                    parent=self.root,
+                )
+                self.mode_var.set("dry_run")
+                return
             confirmed = messagebox.askyesno(
                 "启用自动模式",
                 "自动模式在全部检查通过后会真实点击“下班打卡”。\n\n"
@@ -338,13 +353,49 @@ class ClockoutDemoApp:
                     f"窗口：{'已找到' if data.get('window_found') else '未找到'}；"
                     f"控件：{data.get('element_count', 0)}；"
                     f"考勤页：{'是' if data.get('attendance_page') else '否'}；"
-                    f"下班按钮：{data.get('checkout_button_count', 0)}"
+                    f"下班按钮：{data.get('checkout_button_count', 0)}；"
+                    f"已绑定：{'是' if data.get('bound') else '否'}"
                 )
             except Exception as exc:
                 message = f"诊断失败：{type(exc).__name__}"
             self.root.after(0, lambda: self._finish_diagnostics(message))
 
         threading.Thread(target=work, daemon=True, name="attendance-diagnostics").start()
+
+    def _run_calibration(self) -> None:
+        if self.busy:
+            return
+        if not messagebox.askyesno(
+            "绑定当前考勤页",
+            "请确认飞书当前显示的是今天的考勤打卡页面。程序只会读取页面，不会点击打卡。",
+            parent=self.root,
+        ):
+            return
+        self.busy = True
+        self.message_var.set("正在绑定当前考勤页面")
+
+        def work() -> None:
+            try:
+                fingerprint = self.adapter.calibrate_current_page(datetime.now().date())
+                message = "考勤页面绑定成功，可以先运行演练检查"
+            except Exception as exc:
+                fingerprint = ""
+                message = f"考勤页面绑定失败：{type(exc).__name__}"
+            self.root.after(
+                0, lambda: self._finish_calibration(fingerprint, message)
+            )
+
+        threading.Thread(target=work, daemon=True, name="attendance-calibration").start()
+
+    def _finish_calibration(self, fingerprint: str, message: str) -> None:
+        self.busy = False
+        if fingerprint:
+            self.config = replace(
+                self.config, trusted_container_fingerprint=fingerprint
+            ).validate()
+            save_config(self.config_path, self.config)
+        self.message_var.set(message)
+        self._log(message)
 
     def _finish_diagnostics(self, message: str) -> None:
         self.busy = False

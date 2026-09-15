@@ -289,6 +289,46 @@ def test_final_time_change_blocks_before_claim_or_click(tmp_path: object) -> Non
         assert store.load(initial.date()) is None
 
 
+def test_time_is_checked_again_after_claim(tmp_path: object) -> None:
+    initial = datetime(2026, 9, 15, 17, 5)
+    final_times = iter((initial, datetime(2026, 9, 15, 16, 55)))
+    snapshot = valid_snapshot()
+    adapter = FakeAdapter([snapshot, snapshot], now=initial)
+    engine, store = make_engine(
+        tmp_path,
+        adapter,
+        mode="automatic",
+        now_provider=lambda: next(final_times),
+    )
+
+    result = engine.check(initial)
+    state = store.load(initial.date())
+
+    assert result.status == "unknown"
+    assert adapter.click_calls == 0
+    assert state is not None
+    assert state.outcome == "aborted_before_click"
+
+
+def test_session_is_checked_again_after_claim(tmp_path: object) -> None:
+    initial = datetime(2026, 9, 15, 17, 5)
+    snapshot = valid_snapshot()
+    adapter = FakeAdapter(
+        [snapshot, snapshot],
+        now=initial,
+        interactive_results=[True, True, False],
+    )
+    engine, store = make_engine(tmp_path, adapter, mode="automatic")
+
+    result = engine.check(initial)
+    state = store.load(initial.date())
+
+    assert result.status == "unknown"
+    assert adapter.click_calls == 0
+    assert state is not None
+    assert state.outcome == "aborted_before_click"
+
+
 def test_corrupt_state_blocks_without_reading_page(tmp_path: object) -> None:
     state_path = Path(str(tmp_path)) / "state.json"
     state_path.write_text("{not-json", encoding="utf-8")

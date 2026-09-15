@@ -25,6 +25,7 @@ class AppConfig:
     mode: str = "dry_run"
     weekdays: tuple[int, ...] = (0, 1, 2, 3, 4)
     auto_open_workbench: bool = True
+    trusted_container_fingerprint: str = ""
 
     def validate(self) -> AppConfig:
         if not 1 <= self.work_duration_minutes <= 24 * 60:

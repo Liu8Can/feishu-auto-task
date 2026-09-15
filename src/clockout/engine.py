@@ -189,6 +189,23 @@ class ClockoutEngine:
                 eligible_time,
             )
 
+        invoke_now = self._now_provider()
+        environment_error = self._final_environment_error(
+            initial_now=final_now,
+            current_now=invoke_now,
+            day=day,
+            eligible_time=eligible_time,
+        )
+        if environment_error or not self._session_is_interactive():
+            self._record_outcome(day, "aborted_before_click", success=False)
+            return CheckResult(
+                "unknown",
+                environment_error
+                or "点击资格已锁定，但 Windows 会话已不可交互，今天不会自动重试",
+                first.check_in_time,
+                eligible_time,
+            )
+
         try:
             self.adapter.click_clock_out(second.signature)
         except Exception:
@@ -239,6 +256,26 @@ class ClockoutEngine:
         except Exception:
             # The durable attempted flag was written before clicking, so retry stays blocked.
             pass
+
+    def _final_environment_error(
+        self,
+        *,
+        initial_now: datetime,
+        current_now: datetime,
+        day: date,
+        eligible_time: datetime,
+    ) -> str | None:
+        if current_now.date() != day:
+            return "点击资格已锁定，但日期已经变化，今天不会自动重试"
+        if current_now < initial_now:
+            return "点击资格已锁定，但检测到系统时间回拨，今天不会自动重试"
+        if not is_within_window(
+            current_now, self.config.check_start_time, self.config.check_end_time
+        ):
+            return "点击资格已锁定，但已离开检查时间范围，今天不会自动重试"
+        if current_now < eligible_time:
+            return "点击资格已锁定，但当前时间早于目标时间，今天不会自动重试"
+        return None
 
     def _validate_snapshot(
         self, snapshot: AttendanceSnapshot, now: datetime, expected_day: date

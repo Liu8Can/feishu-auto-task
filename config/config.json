@@ -12,5 +12,6 @@
     3,
     4
   ],
-  "auto_open_workbench": true
+  "auto_open_workbench": true,
+  "trusted_container_fingerprint": ""
 }

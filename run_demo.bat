@@ -8,4 +8,3 @@ if not exist ".venv\Scripts\pythonw.exe" (
 )
 set "PYTHONPATH=%CD%\src"
 start "" ".venv\Scripts\pythonw.exe" -m clockout
-

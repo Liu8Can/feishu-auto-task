@@ -21,6 +21,7 @@ class DummyButton:
     def __init__(self, enabled: bool = True, visible: bool = True) -> None:
         self.enabled = enabled
         self.visible = visible
+        self.invoked = False
 
     def is_enabled(self) -> bool:
         return self.enabled
@@ -28,12 +29,18 @@ class DummyButton:
     def is_visible(self) -> bool:
         return self.visible
 
+    def window_text(self) -> str:
+        return "下班打卡"
+
+    def invoke(self) -> None:
+        self.invoked = True
+
 
 def test_snapshot_extracts_unique_check_in_and_button() -> None:
     adapter = FeishuUiaAdapter(auto_open_workbench=False)
 
     snapshot = adapter._build_snapshot(
-        ["考勤打卡", "今日", "上班已打卡 09:03", "下班打卡"],
+        ["考勤打卡", "9月15日", "上班已打卡 09:03", "下班打卡"],
         [DummyButton()],
         day=date(2026, 9, 15),
         container_id="attendance-container",
@@ -54,7 +61,7 @@ def test_snapshot_blocks_multiple_check_in_times() -> None:
     adapter = FeishuUiaAdapter(auto_open_workbench=False)
 
     snapshot = adapter._build_snapshot(
-        ["考勤打卡", "今日", "上班打卡 09:03", "上班已打卡 09:04", "下班打卡"],
+        ["考勤打卡", "9月15日", "上班打卡 09:03", "上班已打卡 09:04", "下班打卡"],
         [DummyButton()],
         day=date(2026, 9, 15),
         container_id="attendance-container",
@@ -69,7 +76,7 @@ def test_snapshot_blocks_page_warning() -> None:
     adapter = FeishuUiaAdapter(auto_open_workbench=False)
 
     snapshot = adapter._build_snapshot(
-        ["考勤打卡", "今日", "上班打卡 09:03", "下班打卡", "不在考勤范围"],
+        ["考勤打卡", "9月15日", "上班打卡 09:03", "下班打卡", "不在考勤范围"],
         [DummyButton()],
         day=date(2026, 9, 15),
         container_id="attendance-container",
@@ -91,3 +98,24 @@ def test_snapshot_blocks_page_without_current_day() -> None:
     )
 
     assert snapshot.blocking_reason == "未确认当前页面为今天的考勤打卡页"
+
+
+def test_generic_today_text_does_not_invent_page_date() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot(
+        ["考勤打卡", "今日", "上班打卡 09:03", "下班打卡"],
+        [DummyButton()],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="clockout-button",
+    )
+
+    assert snapshot.page_date is None
+    assert snapshot.blocking_reason == "未确认当前页面为今天的考勤打卡页"
+
+
+def test_conflicting_numeric_dates_are_rejected() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    assert adapter._extract_page_date(["9月14日", "9月15日"], 2026) is None
