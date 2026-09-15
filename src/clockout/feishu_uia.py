@@ -46,6 +46,8 @@ class _AttendanceContext:
     buttons: list[object]
     container_id: str
     button_id: str
+    container_runtime_id: tuple[object, ...]
+    button_runtime_id: tuple[object, ...]
 
 
 class FeishuUiaAdapter:
@@ -64,6 +66,8 @@ class FeishuUiaAdapter:
         self._restore_after_action = False
         self._pending_signature = ""
         self._pending_day: date | None = None
+        self._pending_container_runtime_id: tuple[object, ...] = ()
+        self._pending_button_runtime_id: tuple[object, ...] = ()
 
     def snapshot(self, day: date) -> AttendanceSnapshot:
         with self._com_scope():
@@ -118,6 +122,8 @@ class FeishuUiaAdapter:
             ):
                 self._pending_signature = snapshot.signature
                 self._pending_day = day
+                self._pending_container_runtime_id = context.container_runtime_id
+                self._pending_button_runtime_id = context.button_runtime_id
             return snapshot
         except Exception as exc:
             return self._blocked(f"读取飞书页面失败：{type(exc).__name__}")
@@ -147,6 +153,12 @@ class FeishuUiaAdapter:
                 )
                 if context is None:
                     raise RuntimeError("点击前无法重新确认考勤页面")
+                if (
+                    context.container_runtime_id
+                    != self._pending_container_runtime_id
+                    or context.button_runtime_id != self._pending_button_runtime_id
+                ):
+                    raise RuntimeError("点击前考勤容器或按钮实例已经变化")
                 final_snapshot = self._build_snapshot(
                     context.texts,
                     context.buttons,
@@ -255,7 +267,7 @@ class FeishuUiaAdapter:
     def _attendance_context(
         self, window, day: date, *, require_trusted: bool
     ) -> _AttendanceContext | None:
-        candidates: dict[str, _AttendanceContext] = {}
+        candidates: dict[tuple[object, ...], _AttendanceContext] = {}
         title_controls = [
             control
             for control in window.descendants()
@@ -280,7 +292,10 @@ class FeishuUiaAdapter:
                     continue
                 if not any("上班打卡" in text for text in texts):
                     continue
-                buttons = self._checkout_buttons(current, descendants)
+                raw_buttons = self._checkout_buttons(current, descendants)
+                buttons = self._deduplicate_controls(raw_buttons, window)
+                if buttons is None:
+                    continue
                 has_success = any(
                     pattern.search(text)
                     for pattern in SUCCESS_PATTERNS
@@ -288,19 +303,29 @@ class FeishuUiaAdapter:
                 )
                 if not buttons and not has_success:
                     continue
-                container_id = self._stable_fingerprint(current)
+                container_runtime_id = self._runtime_identity(current, window)
+                if not container_runtime_id:
+                    continue
+                container_id = self._persistent_path(current, window)
                 if not container_id:
                     continue
                 if require_trusted and container_id != self.trusted_container_fingerprint:
                     continue
                 button_id = (
-                    self._stable_fingerprint(buttons[0]) if len(buttons) == 1 else ""
+                    self._persistent_path(buttons[0], window) if len(buttons) == 1 else ""
                 )
-                candidates[container_id] = _AttendanceContext(
+                button_runtime_id = (
+                    self._runtime_identity(buttons[0], window)
+                    if len(buttons) == 1
+                    else ()
+                )
+                candidates[container_runtime_id] = _AttendanceContext(
                     texts=texts,
                     buttons=buttons,
                     container_id=container_id,
                     button_id=button_id,
+                    container_runtime_id=container_runtime_id,
+                    button_runtime_id=button_runtime_id,
                 )
                 break
         return next(iter(candidates.values())) if len(candidates) == 1 else None
@@ -420,31 +445,77 @@ class FeishuUiaAdapter:
                         return None
         return next(iter(candidates)) if len(candidates) == 1 else None
 
-    @staticmethod
-    def _stable_fingerprint(control) -> str:
+    @classmethod
+    def _persistent_path(cls, control, root) -> str:
         try:
-            parts = []
-            current = control
-            for _ in range(6):
-                info = current.element_info
-                parts.append(
-                    "|".join(
-                        (
-                            str(getattr(info, "control_type", "")),
-                            str(getattr(info, "class_name", "")),
-                            str(getattr(info, "automation_id", "")),
-                        )
-                    )
-                )
-                if getattr(info, "control_type", "") == "Window":
-                    break
-                current = current.parent()
-            if not any(part.replace("|", "") for part in parts):
+            root_identity = cls._runtime_identity(root, root)
+            if not root_identity:
                 return ""
-            raw = ">".join(parts)
+            parts: list[str] = []
+            current = control
+            for _ in range(64):
+                current_identity = cls._runtime_identity(current, root)
+                if not current_identity:
+                    return ""
+                key = cls._static_control_key(current)
+                if current_identity == root_identity:
+                    parts.append("|".join(key))
+                    break
+                parent = current.parent()
+                siblings = [
+                    sibling
+                    for sibling in parent.children()
+                    if cls._static_control_key(sibling) == key
+                ]
+                matching_indexes = [
+                    index
+                    for index, sibling in enumerate(siblings)
+                    if cls._runtime_identity(sibling, root) == current_identity
+                ]
+                if len(matching_indexes) != 1:
+                    return ""
+                parts.append("|".join((*key, str(matching_indexes[0]))))
+                current = parent
+            else:
+                return ""
+            raw = ">".join(reversed(parts))
             return hashlib.sha256(raw.encode("utf-8")).hexdigest()
         except Exception:
             return ""
+
+    @staticmethod
+    def _static_control_key(control) -> tuple[str, str, str, str]:
+        info = control.element_info
+        return (
+            str(getattr(info, "control_type", "")),
+            str(getattr(info, "class_name", "")),
+            str(getattr(info, "automation_id", "")),
+            str(getattr(info, "framework_id", "")),
+        )
+
+    @staticmethod
+    def _runtime_identity(control, root) -> tuple[object, ...]:
+        try:
+            runtime_id = getattr(control.element_info, "runtime_id", None)
+            if not runtime_id:
+                return ()
+            handle = int(getattr(root, "handle", 0))
+            process_id = int(root.process_id())
+            if not handle or not process_id:
+                return ()
+            return (handle, process_id, *tuple(runtime_id))
+        except Exception:
+            return ()
+
+    @classmethod
+    def _deduplicate_controls(cls, controls: Iterable[object], root) -> list[object] | None:
+        unique: dict[tuple[object, ...], object] = {}
+        for control in controls:
+            identity = cls._runtime_identity(control, root)
+            if not identity:
+                return None
+            unique.setdefault(identity, control)
+        return list(unique.values())
 
     @staticmethod
     def _blocked(reason: str) -> AttendanceSnapshot:
@@ -470,6 +541,8 @@ class FeishuUiaAdapter:
 
     def _clear_pending_button(self, *, keep_restore: bool = False) -> None:
         self._pending_signature = ""
+        self._pending_container_runtime_id = ()
+        self._pending_button_runtime_id = ()
         if not keep_restore:
             self._pending_day = None
 

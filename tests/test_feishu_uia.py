@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +35,73 @@ class DummyButton:
 
     def invoke(self) -> None:
         self.invoked = True
+
+
+class FakeControl:
+    def __init__(
+        self,
+        control_type: str,
+        runtime_id: tuple[int, ...],
+        *,
+        text: str = "",
+        parent: "FakeControl | None" = None,
+    ) -> None:
+        self.element_info = SimpleNamespace(
+            control_type=control_type,
+            class_name="",
+            automation_id="",
+            framework_id="Chrome",
+            runtime_id=runtime_id,
+        )
+        self._text = text
+        self._parent = parent
+        self._children: list[FakeControl] = []
+        self.handle = 100 if control_type == "Window" else 0
+        self.invoke_count = 0
+        if parent is not None:
+            parent._children.append(self)
+
+    def parent(self) -> "FakeControl":
+        assert self._parent is not None
+        return self._parent
+
+    def children(self) -> list["FakeControl"]:
+        return list(self._children)
+
+    def descendants(self) -> list["FakeControl"]:
+        result: list[FakeControl] = []
+        for child in self._children:
+            result.append(child)
+            result.extend(child.descendants())
+        return result
+
+    def window_text(self) -> str:
+        return self._text
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def is_visible(self) -> bool:
+        return True
+
+    def process_id(self) -> int:
+        return 200
+
+    def invoke(self) -> None:
+        self.invoke_count += 1
+
+
+def _add_attendance_container(
+    root: FakeControl, base_runtime_id: int
+) -> tuple[FakeControl, FakeControl]:
+    container = FakeControl("Pane", (base_runtime_id,), parent=root)
+    FakeControl("Text", (base_runtime_id + 1,), text="考勤打卡", parent=container)
+    FakeControl("Text", (base_runtime_id + 2,), text="9月15日", parent=container)
+    FakeControl("Text", (base_runtime_id + 3,), text="上班打卡 09:03", parent=container)
+    button = FakeControl(
+        "Button", (base_runtime_id + 4,), text="下班打卡", parent=container
+    )
+    return container, button
 
 
 def test_snapshot_extracts_unique_check_in_and_button() -> None:
@@ -119,3 +187,81 @@ def test_conflicting_numeric_dates_are_rejected() -> None:
     adapter = FeishuUiaAdapter(auto_open_workbench=False)
 
     assert adapter._extract_page_date(["9月14日", "9月15日"], 2026) is None
+
+
+def test_structurally_identical_sibling_containers_have_distinct_paths() -> None:
+    root = FakeControl("Window", (1,))
+    first, _ = _add_attendance_container(root, 10)
+    second, _ = _add_attendance_container(root, 20)
+
+    assert FeishuUiaAdapter._persistent_path(first, root)
+    assert FeishuUiaAdapter._persistent_path(first, root) != FeishuUiaAdapter._persistent_path(
+        second, root
+    )
+
+
+def test_two_real_attendance_candidates_are_never_folded_into_one() -> None:
+    root = FakeControl("Window", (1,))
+    _add_attendance_container(root, 10)
+    _add_attendance_container(root, 20)
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    context = adapter._attendance_context(
+        root, date(2026, 9, 15), require_trusted=False
+    )
+
+    assert context is None
+
+
+def test_runtime_dedup_only_removes_the_same_control_instance() -> None:
+    root = FakeControl("Window", (1,))
+    _, first_button = _add_attendance_container(root, 10)
+    _, second_button = _add_attendance_container(root, 20)
+
+    same = FeishuUiaAdapter._deduplicate_controls(
+        [first_button, first_button], root
+    )
+    different = FeishuUiaAdapter._deduplicate_controls(
+        [first_button, second_button], root
+    )
+
+    assert same == [first_button]
+    assert different == [first_button, second_button]
+
+
+def test_third_scan_rejects_replaced_runtime_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = FakeControl("Window", (1,))
+    _, button = _add_attendance_container(root, 10)
+    adapter = FeishuUiaAdapter(
+        auto_open_workbench=False,
+        trusted_container_fingerprint="same-persistent-path",
+    )
+    context = feishu_uia._AttendanceContext(
+        texts=["考勤打卡", "9月15日", "上班打卡 09:03", "下班打卡"],
+        buttons=[button],
+        container_id="same-persistent-path",
+        button_id="same-button-path",
+        container_runtime_id=(100, 200, 99),
+        button_runtime_id=(100, 200, 100),
+    )
+    snapshot = adapter._build_snapshot(
+        context.texts,
+        context.buttons,
+        day=date(2026, 9, 15),
+        container_id=context.container_id,
+        button_id=context.button_id,
+    )
+    adapter._pending_signature = snapshot.signature
+    adapter._pending_day = date(2026, 9, 15)
+    adapter._pending_container_runtime_id = (100, 200, 10)
+    adapter._pending_button_runtime_id = (100, 200, 11)
+    monkeypatch.setattr(adapter, "_main_window", lambda: root)
+    monkeypatch.setattr(adapter, "_attendance_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(feishu_uia, "is_interactive_desktop", lambda: True)
+    root.is_minimized = lambda: False  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError):
+        adapter.click_clock_out(snapshot.signature)
+    assert button.invoke_count == 0
