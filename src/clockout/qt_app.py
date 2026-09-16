@@ -4,6 +4,7 @@ import ctypes
 import getpass
 import hashlib
 import logging
+import os
 import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -665,6 +666,17 @@ class AppController(QObject):
         self._active_worker: Worker | None = None
         self._active_task_name = ""
         self._active_task_timed_out = False
+        self._worker_generation = 0
+        self._worker_timeout_ms = 30000
+        self._pending_worker: tuple[
+            Callable[[], object],
+            Callable[[object], None],
+            Callable[[str], None],
+            str,
+        ] | None = None
+        self._shutting_down = False
+        self._quit_grace_ms = 1000
+        self._hard_exit: Callable[[int], object] = os._exit
         self.next_check: datetime | None = None
         self.last_tick = datetime.now()
         self.logger = self._setup_logger(paths.log_dir)
@@ -814,7 +826,13 @@ class AppController(QObject):
             self._schedule_from(now, immediate=True)
             self.log("系统从睡眠或长时间停顿中恢复，已重新安排检查")
         self.last_tick = now
-        if self.config.monitor_enabled and not self.busy and self.next_check and now >= self.next_check:
+        if (
+            self.config.monitor_enabled
+            and not self.busy
+            and self._active_worker is None
+            and self.next_check
+            and now >= self.next_check
+        ):
             self.run_check_now()
         self._update_next_label()
 
@@ -1108,58 +1126,146 @@ class AppController(QObject):
         error_callback: Callable[[str], None],
         task_name: str,
     ) -> None:
+        if self._shutting_down:
+            self.busy = False
+            return
+        if self._active_worker is not None:
+            if self._pending_worker is None:
+                self._pending_worker = (
+                    function,
+                    callback,
+                    error_callback,
+                    task_name,
+                )
+                self.busy = True
+                message = (
+                    f"{self._active_task_name or '上一次调用'}仍在收尾，"
+                    f"{task_name}已排队"
+                )
+                self.window.status_message.setText(message)
+                self.window.set_connection_busy(True, task_name)
+                self.log(message)
+            else:
+                self._show_busy_feedback()
+            return
+        self._launch_worker(function, callback, error_callback, task_name)
+
+    def _launch_worker(
+        self,
+        function: Callable[[], object],
+        callback: Callable[[object], None],
+        error_callback: Callable[[str], None],
+        task_name: str,
+    ) -> None:
         worker = Worker(function, task_name)
+        self._worker_generation += 1
+        token = self._worker_generation
+        self.busy = True
         self._active_worker = worker
         self._active_task_name = task_name
         self._active_task_timed_out = False
         self.window.set_connection_busy(True, task_name)
         worker.signals.finished.connect(
-            lambda value, active=worker: self._worker_finished(
-                active, callback, value
+            lambda value, active=worker, generation=token: self._worker_finished(
+                active, callback, value, generation
             )
         )
         worker.signals.failed.connect(
-            lambda error, active=worker: self._worker_failed(
-                active, error_callback, error
+            lambda error, active=worker, generation=token: self._worker_failed(
+                active, error_callback, error, generation
             )
         )
         self.thread_pool.start(worker)
-        QTimer.singleShot(30000, lambda active=worker: self._worker_timed_out(active))
+        QTimer.singleShot(
+            self._worker_timeout_ms,
+            lambda active=worker, generation=token: self._worker_timed_out(
+                active, generation
+            ),
+        )
 
     def _worker_finished(
         self,
         worker: Worker,
         callback: Callable[[object], None],
         value: object,
+        token: int | None = None,
     ) -> None:
         if worker is not self._active_worker:
             return
-        self._release_worker()
-        callback(value)
+        if getattr(self, "_shutting_down", False):
+            self._complete_active_worker(worker)
+            return
+        should_deliver = (
+            not self._active_task_timed_out
+            and (token is None or token == getattr(self, "_worker_generation", token))
+        )
+        self._complete_active_worker(worker)
+        if should_deliver:
+            callback(value)
 
     def _worker_failed(
         self,
         worker: Worker,
         callback: Callable[[str], None],
         message: str,
+        token: int | None = None,
     ) -> None:
         if worker is not self._active_worker:
             return
-        self._release_worker()
-        callback(message)
+        if getattr(self, "_shutting_down", False):
+            self._complete_active_worker(worker)
+            return
+        should_deliver = (
+            not self._active_task_timed_out
+            and (token is None or token == getattr(self, "_worker_generation", token))
+        )
+        self._complete_active_worker(worker)
+        if should_deliver:
+            callback(message)
 
     def _release_worker(self) -> None:
+        worker = self._active_worker
+        if worker is None:
+            return
+        self._complete_active_worker(worker)
+
+    def _complete_active_worker(self, worker: Worker) -> None:
+        if worker is not self._active_worker:
+            return
+        timed_out = self._active_task_timed_out
+        completed_name = self._active_task_name
+        pending = getattr(self, "_pending_worker", None)
+        self._pending_worker = None
         self.busy = False
         self._active_worker = None
         self._active_task_name = ""
         self._active_task_timed_out = False
-        self.window.set_connection_busy(False)
+        if getattr(self, "_shutting_down", False):
+            return
+        if timed_out:
+            self.log("后台任务已结束收尾：%s", completed_name)
+        if pending is not None:
+            self._launch_worker(*pending)
+        else:
+            self.window.set_connection_busy(False)
 
-    def _worker_timed_out(self, worker: Worker) -> None:
-        if worker is not self._active_worker or self._active_task_timed_out:
+    def _worker_timed_out(self, worker: Worker, token: int | None = None) -> None:
+        if (
+            self._shutting_down
+            or worker is not self._active_worker
+            or self._active_task_timed_out
+            or (token is not None and token != self._worker_generation)
+        ):
             return
         self._active_task_timed_out = True
-        message = f"{self._active_task_name}超过 30 秒仍未完成，请重启程序后重试"
+        self._worker_generation += 1
+        self.busy = False
+        self.window.set_connection_busy(False)
+        seconds = max(1, self._worker_timeout_ms // 1000)
+        message = (
+            f"{self._active_task_name}超过 {seconds} 秒仍未完成；"
+            "界面已恢复，上一次调用仍在收尾"
+        )
         self.window.status_message.setText(message)
         self.window.show_connection_result(message, "error")
         self.log("后台任务超时：%s", self._active_task_name)
@@ -1198,10 +1304,42 @@ class AppController(QObject):
         self.window.append_log(rendered)
 
     def quit(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._worker_generation += 1
+        self._pending_worker = None
+        self.busy = False
+        self.timer.stop()
         self.window._really_close = True
         self.tray.hide()
         self.window.close()
+        if (
+            self._active_worker is not None
+            and not self.thread_pool.waitForDone(self._quit_grace_ms)
+        ):
+            try:
+                self.logger.warning(
+                    "后台任务未在退出宽限期内结束，程序将立即退出"
+                )
+            finally:
+                self._close_log_handlers()
+                self._hard_exit(0)
+            return
         self.app.quit()
+
+    def _close_log_handlers(self) -> None:
+        for handler in list(self.logger.handlers):
+            try:
+                handler.flush()
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+            finally:
+                self.logger.removeHandler(handler)
 
     @staticmethod
     def _setup_logger(log_dir: Path) -> logging.Logger:
