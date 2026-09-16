@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 
@@ -7,7 +9,7 @@ import pytest
 
 import clockout.feishu_uia as feishu_uia
 from clockout.core import PunchAction
-from clockout.feishu_uia import ClockoutClickError, FeishuUiaAdapter
+from clockout.feishu_uia import ClickToken, ClockoutClickError, FeishuUiaAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -866,10 +868,10 @@ def _prepare_text_click(
         container_id=context.container_id,
         button_id=context.button_id,
     )
-    adapter._pending_signature = snapshot.signature
-    adapter._pending_day = date(2026, 9, 15)
-    adapter._pending_container_runtime_id = context.container_runtime_id
-    adapter._pending_button_runtime_id = context.button_runtime_id
+    adapter._legacy_checkout_observation = (
+        date(2026, 9, 15),
+        snapshot.signature,
+    )
     monkeypatch.setattr(
         adapter,
         "_attendance_page",
@@ -985,7 +987,9 @@ def test_text_click_revalidates_runtime_identity_after_activation(
         container_runtime_id=context.container_runtime_id,
         button_runtime_id=(100, 200, 999),
     )
-    pages = iter(((root, context), (root, replaced_context)))
+    pages = iter(
+        ((root, context), (root, context), (root, replaced_context))
+    )
     monkeypatch.setattr(
         adapter,
         "_attendance_page",
@@ -996,6 +1000,250 @@ def test_text_click_revalidates_runtime_identity_after_activation(
         adapter.click_clock_out(signature)
     assert root.focus_count == 1
     assert target.click_input_count == 0
+
+
+def _prepare_action_token(
+    monkeypatch: pytest.MonkeyPatch,
+    action: PunchAction,
+    *,
+    mutate_on_invoke: bool = True,
+    checkout_already_completed: bool = False,
+) -> tuple[FeishuUiaAdapter, FakeControl, FakeControl, ClickToken]:
+    root = FakeControl("Window", (1,), text="假勤")
+    container = FakeControl("Document", (10,), parent=root)
+    FakeControl("Text", (11,), text="2026.09.15", parent=container)
+    FakeControl("Text", (12,), text="应上班 08:50", parent=container)
+    if action is PunchAction.CHECK_IN:
+        target = FakeControl(
+            "Button", (13,), text="上班打卡", parent=container
+        )
+    else:
+        FakeControl("Text", (13,), text="已打卡 08:50", parent=container)
+        target = None
+    FakeControl("Text", (14,), text="应下班 18:50", parent=container)
+    if checkout_already_completed:
+        FakeControl("Text", (15,), text="已打卡 18:51", parent=container)
+    elif action is PunchAction.CHECK_OUT:
+        target = FakeControl(
+            "Button", (15,), text="下班打卡", parent=container
+        )
+    else:
+        FakeControl("Button", (15,), text="下班打卡", parent=container)
+    assert target is not None
+
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+    initial_context = adapter._attendance_context(
+        root,
+        date(2026, 9, 15),
+        require_trusted=False,
+        action=action,
+    )
+    assert initial_context is not None
+    adapter.trusted_container_fingerprint = initial_context.container_id
+
+    def current_page(*args, **kwargs):
+        context = adapter._attendance_context(
+            root,
+            date(2026, 9, 15),
+            require_trusted=True,
+            action=kwargs.get("action", action),
+        )
+        return (root, context) if context is not None else None
+
+    monkeypatch.setattr(adapter, "_attendance_page", current_page)
+    monkeypatch.setattr(feishu_uia, "is_interactive_desktop", lambda: True)
+    snapshot = adapter._build_snapshot_for_action(
+        initial_context.texts,
+        initial_context.buttons,
+        day=date(2026, 9, 15),
+        container_id=initial_context.container_id,
+        button_id=initial_context.button_id,
+        action=action,
+    )
+    token = adapter.prepare_click(
+        date(2026, 9, 15), action, snapshot.signature
+    )
+
+    if mutate_on_invoke:
+        def complete_action() -> None:
+            target.invoke_count += 1
+            target.element_info.control_type = "Text"
+            target._text = (
+                "已打卡 08:51"
+                if action is PunchAction.CHECK_IN
+                else "已打卡 18:51"
+            )
+
+        target.invoke = complete_action  # type: ignore[method-assign]
+    return adapter, root, target, token
+
+
+@pytest.mark.parametrize("action", list(PunchAction))
+def test_action_token_executes_and_verifies_its_own_action(
+    monkeypatch: pytest.MonkeyPatch, action: PunchAction
+) -> None:
+    adapter, _, target, token = _prepare_action_token(monkeypatch, action)
+
+    assert adapter.execute_click(token)
+    assert target.invoke_count == 1
+    assert adapter._click_state == "idle"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"nonce": "forged"},
+        {"action": PunchAction.CHECK_IN},
+        {"day": date(2026, 9, 16)},
+        {"snapshot_signature": "forged"},
+        {"button_runtime_id": (999,)},
+    ],
+)
+def test_forged_or_cross_action_token_never_invokes(
+    monkeypatch: pytest.MonkeyPatch, change: dict[str, object]
+) -> None:
+    adapter, _, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT
+    )
+    forged = replace(token, **change)
+
+    with pytest.raises(ClockoutClickError) as error:
+        adapter.execute_click(forged)
+
+    assert not error.value.invocation_started
+    assert target.invoke_count == 0
+    adapter.cancel_click(token)
+
+
+def test_click_token_is_one_shot_and_cannot_be_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT
+    )
+
+    assert adapter.execute_click(token)
+    with pytest.raises(ClockoutClickError):
+        adapter.execute_click(token)
+
+    assert target.invoke_count == 1
+
+
+def test_prepare_is_serial_and_exact_cancel_releases_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT
+    )
+
+    with pytest.raises(ClockoutClickError):
+        adapter.prepare_click(token.day, token.action, token.snapshot_signature)
+    with pytest.raises(ClockoutClickError):
+        adapter.cancel_click(replace(token, nonce="forged"))
+
+    adapter.cancel_click(token)
+    replacement = adapter.prepare_click(
+        token.day, token.action, token.snapshot_signature
+    )
+    assert replacement.generation > token.generation
+    assert target.invoke_count == 0
+
+
+def test_concurrent_execute_invokes_at_most_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT
+    )
+    barrier = threading.Barrier(3)
+    results: list[bool] = []
+    errors: list[Exception] = []
+
+    def execute() -> None:
+        barrier.wait()
+        try:
+            results.append(adapter.execute_click(token))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=execute) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert results == [True]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ClockoutClickError)
+    assert target.invoke_count == 1
+
+
+def test_verification_allows_runtime_redraw_in_same_bound_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, root, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT, mutate_on_invoke=False
+    )
+    initial_page = adapter._attendance_page(
+        token.day, require_trusted=True, action=token.action
+    )
+    assert initial_page is not None
+    initial_context = initial_page[1]
+    invoked = False
+
+    def complete_with_redraw() -> None:
+        nonlocal invoked
+        invoked = True
+        target.invoke_count += 1
+
+    target.invoke = complete_with_redraw  # type: ignore[method-assign]
+    completed_context = replace(
+        initial_context,
+        texts=[
+            "假勤",
+            "2026.09.15",
+            "应上班 08:50",
+            "已打卡 08:50",
+            "应下班 18:50",
+            "已打卡 18:51",
+        ],
+        buttons=[],
+        button_id="",
+        container_runtime_id=(100, 200, 999),
+        button_runtime_id=(),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_attendance_page",
+        lambda *args, **kwargs: (
+            (root, completed_context)
+            if invoked
+            else (root, initial_context)
+        ),
+    )
+
+    assert adapter.execute_click(token)
+    assert target.invoke_count == 1
+
+
+@pytest.mark.parametrize("action", list(PunchAction))
+def test_other_action_record_does_not_confirm_success(
+    monkeypatch: pytest.MonkeyPatch, action: PunchAction
+) -> None:
+    fake_clock = FakeClock()
+    monkeypatch.setattr(feishu_uia.time_module, "monotonic", fake_clock.monotonic)
+    monkeypatch.setattr(feishu_uia.time_module, "sleep", fake_clock.sleep)
+    adapter, _, target, token = _prepare_action_token(
+        monkeypatch,
+        action,
+        mutate_on_invoke=False,
+        checkout_already_completed=action is PunchAction.CHECK_IN,
+    )
+
+    assert not adapter.execute_click(token)
+    assert target.invoke_count == 1
+    assert adapter._click_state == "idle"
 
 
 def test_snapshot_blocks_multiple_check_in_times() -> None:
@@ -1133,19 +1381,29 @@ def test_third_scan_rejects_replaced_runtime_control(
         container_id=context.container_id,
         button_id=context.button_id,
     )
-    adapter._pending_signature = snapshot.signature
-    adapter._pending_day = date(2026, 9, 15)
-    adapter._pending_container_runtime_id = (100, 200, 10)
-    adapter._pending_button_runtime_id = (100, 200, 11)
+    original_context = replace(
+        context,
+        container_runtime_id=(100, 200, 10),
+        button_runtime_id=(100, 200, 11),
+    )
     monkeypatch.setattr(
         adapter,
         "_attendance_page",
-        lambda *args, **kwargs: (root, context),
+        lambda *args, **kwargs: (root, original_context),
     )
     monkeypatch.setattr(adapter, "_attendance_context", lambda *args, **kwargs: context)
     monkeypatch.setattr(feishu_uia, "is_interactive_desktop", lambda: True)
     root.is_minimized = lambda: False  # type: ignore[attr-defined]
 
+    token = adapter.prepare_click(
+        date(2026, 9, 15), PunchAction.CHECK_OUT, snapshot.signature
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_attendance_page",
+        lambda *args, **kwargs: (root, context),
+    )
+
     with pytest.raises(RuntimeError):
-        adapter.click_clock_out(snapshot.signature)
+        adapter.execute_click(token)
     assert button.invoke_count == 0

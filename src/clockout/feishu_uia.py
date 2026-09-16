@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
+import threading
 import time as time_module
 import winreg
 from contextlib import contextmanager
@@ -31,6 +33,8 @@ EXECUTABLE_FROM_COMMAND_PATTERN = re.compile(
     r'^\s*(?:"([^"]+\.exe)"|([^\s]+\.exe))', re.IGNORECASE
 )
 NAVIGATION_POLL_INTERVAL = 0.2
+VERIFY_POLL_INTERVAL = 0.25
+VERIFY_TIMEOUT = 5.0
 SUCCESS_PATTERNS = (
     re.compile(r"下班已打卡(?:\s*\d{1,2}:\d{2})?"),
     re.compile(r"下班打卡成功"),
@@ -62,6 +66,20 @@ class _AttendanceContext:
     button_runtime_id: tuple[object, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ClickToken:
+    nonce: str
+    generation: int
+    action: PunchAction
+    day: date
+    snapshot_signature: str
+    container_id: str
+    button_id: str
+    container_runtime_id: tuple[object, ...]
+    button_runtime_id: tuple[object, ...]
+    restore_window: bool = False
+
+
 class ClockoutClickError(RuntimeError):
     def __init__(self, message: str, *, invocation_started: bool) -> None:
         super().__init__(message)
@@ -81,11 +99,14 @@ class FeishuUiaAdapter:
         self.auto_open_workbench = auto_open_workbench
         self.navigation_wait = navigation_wait
         self.trusted_container_fingerprint = trusted_container_fingerprint
-        self._restore_after_action = False
-        self._pending_signature = ""
-        self._pending_day: date | None = None
-        self._pending_container_runtime_id: tuple[object, ...] = ()
-        self._pending_button_runtime_id: tuple[object, ...] = ()
+        self._click_lock = threading.RLock()
+        self._click_state = "idle"
+        self._generation = 0
+        self._active_token: ClickToken | None = None
+        self._invoking_token: ClickToken | None = None
+        self._invoking_window: object | None = None
+        self._legacy_checkout_observation: tuple[date, str] | None = None
+        self._legacy_invoked_token: ClickToken | None = None
 
     def snapshot(self, day: date) -> AttendanceSnapshot:
         return self.snapshot_for_action(day, PunchAction.CHECK_OUT)
@@ -94,16 +115,20 @@ class FeishuUiaAdapter:
         self, day: date, action: PunchAction
     ) -> AttendanceSnapshot:
         action = PunchAction(action)
-        with self._com_scope():
-            return self._snapshot(day, action=action)
+        with self._click_lock:
+            with self._com_scope():
+                return self._snapshot(day, action=action)
 
     def _snapshot(
         self, day: date, *, action: PunchAction = PunchAction.CHECK_OUT
     ) -> AttendanceSnapshot:
-        self._clear_pending_button()
+        if action is PunchAction.CHECK_OUT:
+            self._legacy_checkout_observation = None
         if not self.trusted_container_fingerprint:
             return self._blocked("尚未绑定当前飞书考勤页面", action=action)
-        page = self._find_or_open_attendance_page(day, require_trusted=True)
+        page = self._find_or_open_attendance_page(
+            day, require_trusted=True, action=action
+        )
         if page is None:
             return self._blocked(
                 "未确认当前页面为今天的考勤打卡页", action=action
@@ -111,7 +136,6 @@ class FeishuUiaAdapter:
 
         window, context = page
         was_minimized = bool(window.is_minimized())
-        self._restore_after_action = was_minimized
         try:
             if was_minimized:
                 window.restore()
@@ -136,16 +160,12 @@ class FeishuUiaAdapter:
                 button_id=context.button_id,
                 action=action,
             )
-            if (
-                action is PunchAction.CHECK_OUT
-                and snapshot.blocking_reason is None
-                and snapshot.button_count == 1
-                and snapshot.button_enabled
-            ):
-                self._pending_signature = snapshot.signature
-                self._pending_day = day
-                self._pending_container_runtime_id = context.container_runtime_id
-                self._pending_button_runtime_id = context.button_runtime_id
+            if action is PunchAction.CHECK_OUT:
+                self._legacy_checkout_observation = (
+                    (day, snapshot.signature)
+                    if self._snapshot_can_prepare(snapshot)
+                    else None
+                )
             return snapshot
         except Exception as exc:
             return self._blocked(
@@ -158,80 +178,211 @@ class FeishuUiaAdapter:
                 except Exception:
                     pass
 
-    def click_clock_out(self, expected_signature: str) -> None:
-        with self._com_scope():
-            window = None
-            invocation_started = False
-            try:
-                window, button = self._confirmed_checkout_target(expected_signature)
-                if window.is_minimized():
-                    window.restore()
-                    time_module.sleep(0.8)
-                    window, button = self._confirmed_checkout_target(
-                        expected_signature
-                    )
-                if button.element_info.control_type == "Text":
-                    window.set_focus()
-                    time_module.sleep(0.2)
-                    window, button = self._confirmed_checkout_target(
-                        expected_signature
-                    )
-                    self._validate_text_click_target(window, button)
-                    if not is_interactive_desktop():
-                        raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
-                self._clear_pending_button(keep_restore=True)
-                invocation_started = True
-                self._invoke_checkout_control(button)
-            except Exception as exc:
-                if window is not None:
-                    self._restore_window(window)
-                else:
-                    self._restore_after_action = False
-                raise ClockoutClickError(
-                    f"下班打卡按钮无法安全调用：{exc}",
-                    invocation_started=invocation_started,
-                ) from exc
+    @staticmethod
+    def _snapshot_can_prepare(snapshot: AttendanceSnapshot) -> bool:
+        return bool(
+            not snapshot.action_completed
+            and snapshot.blocking_reason is None
+            and snapshot.button_count == 1
+            and snapshot.button_enabled
+            and snapshot.container_id
+            and snapshot.button_id
+        )
 
-    def _confirmed_checkout_target(
-        self, expected_signature: str
-    ) -> tuple[object, object]:
-        if (
-            self._pending_day is None
-            or self._pending_signature != expected_signature
-        ):
-            raise RuntimeError("点击目标与最终页面快照不一致")
+    def prepare_click(
+        self,
+        day: date,
+        action: PunchAction,
+        expected_signature: str,
+    ) -> ClickToken:
+        action = PunchAction(action)
+        with self._click_lock:
+            if self._click_state != "idle":
+                raise ClockoutClickError(
+                    "已有打卡动作正在准备或验证",
+                    invocation_started=False,
+                )
+            with self._com_scope():
+                window = None
+                restore_window = False
+                try:
+                    window, context = self._confirmed_action_context(
+                        day, action, expected_signature
+                    )
+                    restore_window = bool(window.is_minimized())
+                    if restore_window:
+                        window.restore()
+                        time_module.sleep(0.8)
+                        window, context = self._confirmed_action_context(
+                            day, action, expected_signature
+                        )
+                    self._generation += 1
+                    token = ClickToken(
+                        nonce=secrets.token_urlsafe(24),
+                        generation=self._generation,
+                        action=action,
+                        day=day,
+                        snapshot_signature=expected_signature,
+                        container_id=context.container_id,
+                        button_id=context.button_id,
+                        container_runtime_id=context.container_runtime_id,
+                        button_runtime_id=context.button_runtime_id,
+                        restore_window=restore_window,
+                    )
+                    self._active_token = token
+                    self._click_state = "prepared"
+                    return token
+                except ClockoutClickError:
+                    raise
+                except Exception as exc:
+                    raise ClockoutClickError(
+                        f"{self._action_label(action)}按钮无法安全准备：{exc}",
+                        invocation_started=False,
+                    ) from exc
+                finally:
+                    if restore_window and window is not None:
+                        try:
+                            window.minimize()
+                        except Exception:
+                            pass
+
+    def cancel_click(self, token: ClickToken) -> None:
+        with self._click_lock:
+            if self._click_state != "prepared" or token != self._active_token:
+                raise ClockoutClickError(
+                    "取消目标不是当前已准备的打卡动作",
+                    invocation_started=False,
+                )
+            self._active_token = None
+            self._click_state = "idle"
+
+    def execute_click(self, token: ClickToken) -> bool:
+        with self._click_lock:
+            with self._com_scope():
+                self._invoke_prepared_click(token)
+                return self._verify_invoked_click(token)
+
+    def click_clock_out(self, expected_signature: str) -> None:
+        with self._click_lock:
+            observation = self._legacy_checkout_observation
+            if observation is None or observation[1] != expected_signature:
+                raise ClockoutClickError(
+                    "点击目标与最终页面快照不一致",
+                    invocation_started=False,
+                )
+            token = self.prepare_click(
+                observation[0], PunchAction.CHECK_OUT, expected_signature
+            )
+            self._legacy_checkout_observation = None
+            with self._com_scope():
+                self._invoke_prepared_click(token)
+            self._legacy_invoked_token = token
+
+    def _confirmed_action_context(
+        self,
+        day: date,
+        action: PunchAction,
+        expected_signature: str,
+        token: ClickToken | None = None,
+    ) -> tuple[object, _AttendanceContext]:
         if not is_interactive_desktop():
             raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
-        page = self._attendance_page(self._pending_day, require_trusted=True)
+        page = self._attendance_page(
+            day, require_trusted=True, action=action
+        )
         if page is None:
             raise RuntimeError("点击前未找到唯一考勤窗口")
         window, context = page
-        if (
-            context.container_runtime_id != self._pending_container_runtime_id
-            or context.button_runtime_id != self._pending_button_runtime_id
-        ):
-            raise RuntimeError("点击前考勤容器或按钮实例已经变化")
-        final_snapshot = self._build_snapshot(
+        final_snapshot = self._build_snapshot_for_action(
             context.texts,
             context.buttons,
-            day=self._pending_day,
+            day=day,
             container_id=context.container_id,
             button_id=context.button_id,
+            action=action,
         )
         if (
             final_snapshot.signature != expected_signature
-            or final_snapshot.page_date != self._pending_day
+            or final_snapshot.page_date != day
+            or final_snapshot.action is not action
+            or final_snapshot.action_completed
             or final_snapshot.blocking_reason is not None
         ):
             raise RuntimeError("点击前页面状态已经变化")
+        if token is not None and (
+            context.container_id != token.container_id
+            or context.button_id != token.button_id
+            or context.container_runtime_id != token.container_runtime_id
+            or context.button_runtime_id != token.button_runtime_id
+        ):
+            raise RuntimeError("点击前考勤容器或按钮实例已经变化")
         if len(context.buttons) != 1:
-            raise RuntimeError("点击前下班打卡按钮不唯一")
+            raise RuntimeError("点击前打卡按钮不唯一")
         button = context.buttons[0]
-        if self._text(button) != CHECKOUT_BUTTON_TEXT:
+        if self._text(button) != self._button_text(action):
             raise RuntimeError("点击前按钮文字已经变化")
         if not button.is_enabled() or not button.is_visible():
-            raise RuntimeError("点击前下班打卡按钮不唯一或不可用")
-        return window, button
+            raise RuntimeError("点击前打卡按钮不唯一或不可用")
+        return window, context
+
+    def _invoke_prepared_click(self, token: ClickToken) -> None:
+        if self._click_state != "prepared" or token != self._active_token:
+            raise ClockoutClickError(
+                "点击令牌不是当前已准备的打卡动作",
+                invocation_started=False,
+            )
+        window = None
+        invocation_started = False
+        try:
+            window, context = self._confirmed_action_context(
+                token.day,
+                token.action,
+                token.snapshot_signature,
+                token,
+            )
+            if window.is_minimized():
+                window.restore()
+                time_module.sleep(0.8)
+                window, context = self._confirmed_action_context(
+                    token.day,
+                    token.action,
+                    token.snapshot_signature,
+                    token,
+                )
+            button = context.buttons[0]
+            if button.element_info.control_type == "Text":
+                window.set_focus()
+                time_module.sleep(0.2)
+                window, context = self._confirmed_action_context(
+                    token.day,
+                    token.action,
+                    token.snapshot_signature,
+                    token,
+                )
+                button = context.buttons[0]
+                self._validate_text_click_target(window, button, token)
+            if not is_interactive_desktop():
+                raise RuntimeError("点击前 Windows 已不再是可交互桌面会话")
+            self._active_token = None
+            self._invoking_token = token
+            self._invoking_window = window
+            self._click_state = "invoking"
+            invocation_started = True
+            self._invoke_punch_control(button, token.action)
+        except Exception as exc:
+            self._active_token = None
+            self._invoking_token = None
+            self._invoking_window = None
+            self._click_state = "idle"
+            if window is not None and token.restore_window:
+                try:
+                    window.minimize()
+                except Exception:
+                    pass
+            raise ClockoutClickError(
+                f"{self._action_label(token.action)}按钮无法安全调用：{exc}",
+                invocation_started=invocation_started,
+            ) from exc
 
     @classmethod
     def _top_level_window_handle(cls, control) -> int:
@@ -245,25 +396,27 @@ class FeishuUiaAdapter:
                 return 0
         return 0
 
-    def _validate_text_click_target(self, window, button) -> None:
+    def _validate_text_click_target(
+        self, window, button, token: ClickToken
+    ) -> None:
         window_handle = int(window.handle)
         if int(win32gui.GetForegroundWindow()) != window_handle:
             raise RuntimeError("点击前考勤窗口未处于前台")
         button_runtime_id = self._runtime_identity(button, window)
-        if not button_runtime_id or button_runtime_id != self._pending_button_runtime_id:
-            raise RuntimeError("点击前下班打卡按钮实例已经变化")
+        if not button_runtime_id or button_runtime_id != token.button_runtime_id:
+            raise RuntimeError("点击前打卡按钮实例已经变化")
         rectangle = button.rectangle()
         if rectangle.right <= rectangle.left or rectangle.bottom <= rectangle.top:
-            raise RuntimeError("点击前下班打卡目标位置无效")
+            raise RuntimeError("点击前打卡目标位置无效")
         center_x = (rectangle.left + rectangle.right) // 2
         center_y = (rectangle.top + rectangle.bottom) // 2
         hit_control = Desktop(backend="uia").from_point(center_x, center_y)
         if self._top_level_window_handle(hit_control) != window_handle:
-            raise RuntimeError("下班打卡目标被其他窗口遮挡")
+            raise RuntimeError("打卡目标被其他窗口遮挡")
         if not self._control_chain_contains_identity(
             hit_control, button_runtime_id, window
         ):
-            raise RuntimeError("下班打卡目标被页面内其他控件遮挡")
+            raise RuntimeError("打卡目标被页面内其他控件遮挡")
         if int(win32gui.GetForegroundWindow()) != window_handle:
             raise RuntimeError("点击前考勤窗口已离开前台")
 
@@ -284,31 +437,72 @@ class FeishuUiaAdapter:
         return False
 
     def verify_success(self) -> bool:
-        time_module.sleep(2.5)
-        with self._com_scope():
-            if self._pending_day is None:
-                self._restore_after_action = False
+        with self._click_lock:
+            token = self._legacy_invoked_token
+            self._legacy_invoked_token = None
+            if token is None:
                 return False
-            page = self._attendance_page(self._pending_day, require_trusted=True)
-            if page is None:
-                self._restore_after_action = False
-                self._pending_day = None
-                return False
-            window, context = page
-            try:
-                context = self._attendance_context(
-                    window, self._pending_day, require_trusted=True
+            with self._com_scope():
+                return self._verify_invoked_click(token)
+
+    def _verify_invoked_click(self, token: ClickToken) -> bool:
+        if self._click_state != "invoking" or token != self._invoking_token:
+            raise ClockoutClickError(
+                "验证令牌不是当前已调用的打卡动作",
+                invocation_started=True,
+            )
+        deadline = time_module.monotonic() + VERIFY_TIMEOUT
+        window = None
+        try:
+            while True:
+                page = self._attendance_page(
+                    token.day,
+                    require_trusted=True,
+                    action=token.action,
                 )
-                if context is None:
+                if page is not None:
+                    window, context = page
+                    if context.container_id == token.container_id:
+                        snapshot = self._build_snapshot_for_action(
+                            context.texts,
+                            context.buttons,
+                            day=token.day,
+                            container_id=context.container_id,
+                            button_id=context.button_id,
+                            action=token.action,
+                        )
+                        if self._snapshot_confirms_action(snapshot, token.action):
+                            return True
+                remaining = deadline - time_module.monotonic()
+                if remaining <= 0:
                     return False
-                return any(
-                    pattern.search(text)
-                    for pattern in SUCCESS_PATTERNS
-                    for text in context.texts
-                ) or self._has_independent_checkout_record(context.texts)
-            finally:
-                self._restore_window(window)
-                self._pending_day = None
+                time_module.sleep(min(VERIFY_POLL_INTERVAL, remaining))
+        finally:
+            restore_target = (
+                window if window is not None else self._invoking_window
+            )
+            if token.restore_window and restore_target is not None:
+                try:
+                    restore_target.minimize()
+                except Exception:
+                    pass
+            self._invoking_token = None
+            self._invoking_window = None
+            self._click_state = "idle"
+
+    @staticmethod
+    def _snapshot_confirms_action(
+        snapshot: AttendanceSnapshot, action: PunchAction
+    ) -> bool:
+        if (
+            snapshot.action is not action
+            or not snapshot.action_completed
+            or snapshot.blocking_reason is not None
+        ):
+            return False
+        if action is PunchAction.CHECK_IN:
+            return snapshot.check_in_time is not None
+        return snapshot.already_clocked_out
 
     def is_session_interactive(self) -> bool:
         return is_interactive_desktop()
@@ -383,8 +577,11 @@ class FeishuUiaAdapter:
         *,
         require_trusted: bool,
         allow_navigation: bool | None = None,
+        action: PunchAction = PunchAction.CHECK_OUT,
     ) -> tuple[object, _AttendanceContext] | None:
-        page = self._attendance_page(day, require_trusted=require_trusted)
+        page = self._attendance_page(
+            day, require_trusted=require_trusted, action=action
+        )
         navigation_enabled = (
             self.auto_open_workbench
             if allow_navigation is None
@@ -400,7 +597,7 @@ class FeishuUiaAdapter:
 
         state = self._wait_until(
             lambda: self._attendance_page_or_ready_main_window(
-                day, require_trusted=require_trusted
+                day, require_trusted=require_trusted, action=action
             )
         )
         if state is None:
@@ -413,13 +610,21 @@ class FeishuUiaAdapter:
         if not self._open_attendance_entry(value):
             return None
         return self._wait_until(
-            lambda: self._attendance_page(day, require_trusted=require_trusted)
+            lambda: self._attendance_page(
+                day, require_trusted=require_trusted, action=action
+            )
         )
 
     def _attendance_page_or_ready_main_window(
-        self, day: date, *, require_trusted: bool
+        self,
+        day: date,
+        *,
+        require_trusted: bool,
+        action: PunchAction = PunchAction.CHECK_OUT,
     ) -> tuple[str, object] | None:
-        page = self._attendance_page(day, require_trusted=require_trusted)
+        page = self._attendance_page(
+            day, require_trusted=require_trusted, action=action
+        )
         if page is not None:
             return "page", page
         window = self._main_window()
@@ -495,12 +700,19 @@ class FeishuUiaAdapter:
         return candidates
 
     def _attendance_page(
-        self, day: date, *, require_trusted: bool
+        self,
+        day: date,
+        *,
+        require_trusted: bool,
+        action: PunchAction = PunchAction.CHECK_OUT,
     ) -> tuple[object, _AttendanceContext] | None:
         candidates = []
         for window in self._feishu_windows():
             context = self._attendance_context(
-                window, day, require_trusted=require_trusted
+                window,
+                day,
+                require_trusted=require_trusted,
+                action=action,
             )
             if context is not None:
                 candidates.append((window, context))
@@ -917,7 +1129,19 @@ class FeishuUiaAdapter:
         )
 
     @staticmethod
-    def _invoke_checkout_control(control) -> None:
+    def _button_text(action: PunchAction) -> str:
+        return (
+            CHECKIN_BUTTON_TEXT
+            if action is PunchAction.CHECK_IN
+            else CHECKOUT_BUTTON_TEXT
+        )
+
+    @staticmethod
+    def _action_label(action: PunchAction) -> str:
+        return "上班打卡" if action is PunchAction.CHECK_IN else "下班打卡"
+
+    @classmethod
+    def _invoke_punch_control(cls, control, action: PunchAction) -> None:
         control_type = control.element_info.control_type
         if control_type == "Button":
             control.invoke()
@@ -925,7 +1149,11 @@ class FeishuUiaAdapter:
         if control_type == "Text":
             control.click_input()
             return
-        raise RuntimeError("下班打卡控件类型不受支持")
+        raise RuntimeError(f"{cls._action_label(action)}控件类型不受支持")
+
+    @classmethod
+    def _invoke_checkout_control(cls, control) -> None:
+        cls._invoke_punch_control(control, PunchAction.CHECK_OUT)
 
     @classmethod
     def _persistent_path(cls, control, root) -> str:
@@ -1018,21 +1246,6 @@ class FeishuUiaAdapter:
             action=action,
             action_completed=False,
         )
-
-    def _restore_window(self, window) -> None:
-        if self._restore_after_action:
-            try:
-                window.minimize()
-            except Exception:
-                pass
-        self._restore_after_action = False
-
-    def _clear_pending_button(self, *, keep_restore: bool = False) -> None:
-        self._pending_signature = ""
-        self._pending_container_runtime_id = ()
-        self._pending_button_runtime_id = ()
-        if not keep_restore:
-            self._pending_day = None
 
     @staticmethod
     @contextmanager
