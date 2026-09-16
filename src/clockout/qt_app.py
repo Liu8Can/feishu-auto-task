@@ -6,7 +6,7 @@ import hashlib
 import logging
 import os
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -69,6 +69,35 @@ from .runtime import (
     set_start_with_windows,
 )
 from .storage import JsonStateStore, StateStoreError
+
+
+IPC_SHOW = b"show"
+IPC_WAKE = b"wake"
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchRequest:
+    background: bool
+    ipc_command: bytes
+
+
+def _parse_launch_request(arguments: list[str]) -> LaunchRequest:
+    scheduled_wake = "--scheduled-wake" in arguments
+    background = scheduled_wake or any(
+        argument in {"--background", "--startup"} for argument in arguments
+    )
+    return LaunchRequest(
+        background=background,
+        ipc_command=IPC_WAKE if scheduled_wake else IPC_SHOW,
+    )
+
+
+def _parse_ipc_command(payload: bytes) -> str | None:
+    if payload == IPC_SHOW:
+        return "show"
+    if payload == IPC_WAKE:
+        return "wake"
+    return None
 
 
 APP_TITLE = "飞书动态下班打卡助手"
@@ -715,6 +744,17 @@ class AppController(QObject):
         if reason in {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick}:
             self.window.show_from_tray()
 
+    def handle_instance_command(self, command: str) -> bool:
+        if command == "show":
+            self.window.show_from_tray()
+            self.log("已从第二次启动请求唤回主界面")
+            return True
+        if command == "wake":
+            self._schedule_from(datetime.now())
+            self.log("已收到计划唤醒请求，静默重新安排检查")
+            return True
+        return False
+
     def _engine(self) -> ClockoutEngine:
         config = EngineConfig(
             mode=self.config.mode,
@@ -1359,12 +1399,14 @@ def _server_name() -> str:
     return f"FeishuClockoutAssistant-{identity}"
 
 
-def _notify_existing_instance(name: str) -> bool:
+def _notify_existing_instance(name: str, command: bytes = IPC_SHOW) -> bool:
+    if _parse_ipc_command(command) is None:
+        raise ValueError("本地实例命令无效")
     socket = QLocalSocket()
     socket.connectToServer(name)
     if not socket.waitForConnected(1000):
         return False
-    socket.write(b"show")
+    socket.write(command)
     socket.flush()
     if socket.bytesToWrite() > 0:
         socket.waitForBytesWritten(1000)
@@ -1373,21 +1415,30 @@ def _notify_existing_instance(name: str) -> bool:
     return True
 
 
+def _dispatch_ipc_command(controller: AppController, payload: bytes) -> bytes:
+    command = _parse_ipc_command(payload)
+    if command is None or not controller.handle_instance_command(command):
+        return b"rejected"
+    return b"ok"
+
+
 def run() -> int:
+    request = _parse_launch_request(sys.argv[1:])
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setQuitOnLastWindowClosed(False)
     _apply_light_palette(app)
     app.setStyleSheet(APP_QSS)
     name = _server_name()
-    if _notify_existing_instance(name):
+    if _notify_existing_instance(name, request.ipc_command):
         return 0
     QLocalServer.removeServer(name)
     server = QLocalServer(app)
     if not server.listen(name):
         return 1
-    background = any(argument in {"--background", "--startup"} for argument in sys.argv[1:])
-    controller = AppController(app, runtime_paths(), background)
+    controller = AppController(app, runtime_paths(), request.background)
+    if request.ipc_command == IPC_WAKE:
+        controller.handle_instance_command("wake")
 
     def activate_from_socket() -> None:
         connection = server.nextPendingConnection()
@@ -1395,12 +1446,10 @@ def run() -> int:
             return
 
         def handle_message() -> None:
-            if bytes(connection.readAll()) == b"show":
-                controller.window.show_from_tray()
-                controller.log("已从第二次启动请求唤回主界面")
-                connection.write(b"ok")
-                connection.flush()
-                connection.waitForBytesWritten(500)
+            response = _dispatch_ipc_command(controller, bytes(connection.readAll()))
+            connection.write(response)
+            connection.flush()
+            connection.waitForBytesWritten(500)
             connection.disconnectFromServer()
 
         if connection.bytesAvailable():

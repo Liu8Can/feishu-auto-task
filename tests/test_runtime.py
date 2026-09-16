@@ -14,6 +14,7 @@ import pytest
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication
 
+import clockout.qt_app as qt_app
 from clockout.config import AppConfig
 from clockout.core import AttendanceSnapshot, CheckResult
 from clockout.qt_app import AppController
@@ -115,6 +116,110 @@ def test_next_workday_skips_weekend() -> None:
     result = controller._next_workday_start(date(2026, 9, 18))
 
     assert result == datetime(2026, 9, 21, 15, 0)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "background", "command"),
+    [
+        ([], False, b"show"),
+        (["--background"], True, b"show"),
+        (["--startup"], True, b"show"),
+        (["--scheduled-wake"], True, b"wake"),
+    ],
+)
+def test_launch_arguments_select_background_and_ipc_command(
+    arguments: list[str], background: bool, command: bytes
+) -> None:
+    request = qt_app._parse_launch_request(arguments)
+
+    assert request.background is background
+    assert request.ipc_command == command
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [(b"show", "show"), (b"wake", "wake"), (b"", None), (b"wake-now", None)],
+)
+def test_ipc_protocol_accepts_only_exact_known_commands(
+    payload: bytes, expected: str | None
+) -> None:
+    assert qt_app._parse_ipc_command(payload) == expected
+
+
+def test_notify_existing_instance_sends_selected_command(monkeypatch) -> None:
+    class SocketSink:
+        def __init__(self) -> None:
+            self.written = b""
+
+        def connectToServer(self, name: str) -> None:
+            self.name = name
+
+        def waitForConnected(self, timeout: int) -> bool:
+            return True
+
+        def write(self, payload: bytes) -> None:
+            self.written = payload
+
+        def flush(self) -> None:
+            pass
+
+        def bytesToWrite(self) -> int:
+            return 0
+
+        def waitForReadyRead(self, timeout: int) -> bool:
+            return True
+
+        def disconnectFromServer(self) -> None:
+            pass
+
+    socket = SocketSink()
+    monkeypatch.setattr(qt_app, "QLocalSocket", lambda: socket)
+
+    assert qt_app._notify_existing_instance("test-server", b"wake")
+    assert socket.name == "test-server"
+    assert socket.written == b"wake"
+
+    with pytest.raises(ValueError, match="命令无效"):
+        qt_app._notify_existing_instance("test-server", b"unknown")
+
+
+def test_instance_commands_show_or_silently_reschedule() -> None:
+    controller = AppController.__new__(AppController)
+    shown: list[bool] = []
+    scheduled: list[tuple[datetime, bool]] = []
+    logged: list[str] = []
+    controller.window = SimpleNamespace(show_from_tray=lambda: shown.append(True))
+    controller.log = logged.append
+    controller._schedule_from = (
+        lambda now, *, immediate=False: scheduled.append((now, immediate))
+    )
+    controller._engine = lambda: pytest.fail("计划唤醒不得直接调用引擎")
+
+    assert controller.handle_instance_command("wake")
+    assert shown == []
+    assert len(scheduled) == 1
+    assert scheduled[0][1] is False
+
+    assert controller.handle_instance_command("show")
+    assert shown == [True]
+    assert len(scheduled) == 1
+
+    assert not controller.handle_instance_command("unknown")
+    assert shown == [True]
+    assert len(scheduled) == 1
+
+
+def test_ipc_dispatch_rejects_unknown_payload_without_controller_action() -> None:
+    commands: list[str] = []
+    controller = SimpleNamespace(
+        handle_instance_command=lambda command: commands.append(command) or True
+    )
+
+    assert qt_app._dispatch_ipc_command(controller, b"show") == b"ok"
+    assert commands == ["show"]
+
+    assert qt_app._dispatch_ipc_command(controller, b"unknown") == b"rejected"
+    assert commands == ["show"]
 
 
 def test_monitor_and_retry_defaults_are_enabled_for_old_config() -> None:
