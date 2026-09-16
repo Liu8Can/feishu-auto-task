@@ -15,11 +15,12 @@ import win32gui
 from pywinauto import Desktop
 from pywinauto.application import process_module
 
-from .core import AttendanceSnapshot, parse_unique_check_in_time
+from .core import AttendanceSnapshot, PunchAction, parse_unique_check_in_time
 from .session import is_interactive_desktop
 
 
 CHECKOUT_BUTTON_TEXT = "下班打卡"
+CHECKIN_BUTTON_TEXT = "上班打卡"
 FEISHU_EXECUTABLE = "feishu.exe"
 FEISHU_WINDOW_TITLES = ("飞书", "假勤")
 ATTENDANCE_PAGE_NAMES = ("考勤打卡", "假勤")
@@ -87,16 +88,26 @@ class FeishuUiaAdapter:
         self._pending_button_runtime_id: tuple[object, ...] = ()
 
     def snapshot(self, day: date) -> AttendanceSnapshot:
-        with self._com_scope():
-            return self._snapshot(day)
+        return self.snapshot_for_action(day, PunchAction.CHECK_OUT)
 
-    def _snapshot(self, day: date) -> AttendanceSnapshot:
+    def snapshot_for_action(
+        self, day: date, action: PunchAction
+    ) -> AttendanceSnapshot:
+        action = PunchAction(action)
+        with self._com_scope():
+            return self._snapshot(day, action=action)
+
+    def _snapshot(
+        self, day: date, *, action: PunchAction = PunchAction.CHECK_OUT
+    ) -> AttendanceSnapshot:
         self._clear_pending_button()
         if not self.trusted_container_fingerprint:
-            return self._blocked("尚未绑定当前飞书考勤页面")
+            return self._blocked("尚未绑定当前飞书考勤页面", action=action)
         page = self._find_or_open_attendance_page(day, require_trusted=True)
         if page is None:
-            return self._blocked("未确认当前页面为今天的考勤打卡页")
+            return self._blocked(
+                "未确认当前页面为今天的考勤打卡页", action=action
+            )
 
         window, context = page
         was_minimized = bool(window.is_minimized())
@@ -105,19 +116,29 @@ class FeishuUiaAdapter:
             if was_minimized:
                 window.restore()
                 time_module.sleep(0.8)
-                context = self._attendance_context(window, day, require_trusted=True)
+            if was_minimized or action is PunchAction.CHECK_IN:
+                context = self._attendance_context(
+                    window, day, require_trusted=True, action=action
+                )
 
             if context is None:
-                return self._blocked("未确认当前页面为今天的考勤打卡页")
-            snapshot = self._build_snapshot(
+                reason = (
+                    "未确认页面中的应上班区块"
+                    if action is PunchAction.CHECK_IN
+                    else "未确认当前页面为今天的考勤打卡页"
+                )
+                return self._blocked(reason, action=action)
+            snapshot = self._build_snapshot_for_action(
                 context.texts,
                 context.buttons,
                 day=day,
                 container_id=context.container_id,
                 button_id=context.button_id,
+                action=action,
             )
             if (
-                snapshot.blocking_reason is None
+                action is PunchAction.CHECK_OUT
+                and snapshot.blocking_reason is None
                 and snapshot.button_count == 1
                 and snapshot.button_enabled
             ):
@@ -127,7 +148,9 @@ class FeishuUiaAdapter:
                 self._pending_button_runtime_id = context.button_runtime_id
             return snapshot
         except Exception as exc:
-            return self._blocked(f"读取飞书页面失败：{type(exc).__name__}")
+            return self._blocked(
+                f"读取飞书页面失败：{type(exc).__name__}", action=action
+            )
         finally:
             if was_minimized:
                 try:
@@ -484,13 +507,19 @@ class FeishuUiaAdapter:
         return candidates[0] if len(candidates) == 1 else None
 
     def _attendance_context(
-        self, window, day: date, *, require_trusted: bool
+        self,
+        window,
+        day: date,
+        *,
+        require_trusted: bool,
+        action: PunchAction = PunchAction.CHECK_OUT,
     ) -> _AttendanceContext | None:
         candidates: dict[tuple[object, ...], _AttendanceContext] = {}
         anchor_controls = [
             control
             for control in window.descendants()
-            if self._text(control) in ("考勤打卡", CHECKOUT_BUTTON_TEXT)
+            if self._text(control)
+            in ("考勤打卡", CHECKIN_BUTTON_TEXT, CHECKOUT_BUTTON_TEXT)
             or self._text(control).startswith(("应上班", "应下班"))
             or any(pattern.search(self._text(control)) for pattern in SUCCESS_PATTERNS)
             or BARE_CLOCKED_PATTERN.fullmatch(self._text(control))
@@ -515,7 +544,14 @@ class FeishuUiaAdapter:
                     continue
                 if not self._has_attendance_structure(texts):
                     continue
-                raw_buttons = self._checkout_buttons(current, descendants)
+                if (
+                    action is PunchAction.CHECK_IN
+                    and self._independent_section_bounds(texts) is None
+                ):
+                    continue
+                raw_buttons = self._action_buttons(
+                    current, descendants, action=action
+                )
                 buttons = self._deduplicate_controls(raw_buttons, window)
                 if buttons is None:
                     continue
@@ -551,20 +587,57 @@ class FeishuUiaAdapter:
                 break
         return next(iter(candidates.values())) if len(candidates) == 1 else None
 
+    def _action_buttons(
+        self,
+        window,
+        descendants: Iterable[object] | None = None,
+        *,
+        action: PunchAction,
+    ) -> list[object]:
+        controls = list(
+            descendants if descendants is not None else window.descendants()
+        )
+        if action is PunchAction.CHECK_OUT:
+            return self._checkout_buttons(window, controls)
+
+        check_in_headers = [
+            index
+            for index, control in enumerate(controls)
+            if self._text(control).startswith("应上班")
+        ]
+        check_out_headers = [
+            index
+            for index, control in enumerate(controls)
+            if self._text(control).startswith("应下班")
+        ]
+        if len(check_in_headers) != 1 or len(check_out_headers) != 1:
+            return []
+        start, end = check_in_headers[0], check_out_headers[0]
+        if start >= end:
+            return []
+        return [
+            control
+            for control in controls[start + 1 : end]
+            if self._is_punch_button(control, CHECKIN_BUTTON_TEXT)
+        ]
+
+    def _is_punch_button(self, control, expected_text: str) -> bool:
+        try:
+            return bool(
+                control.element_info.control_type in {"Button", "Text"}
+                and self._text(control) == expected_text
+            )
+        except Exception:
+            return False
+
     def _checkout_buttons(
         self, window, descendants: Iterable[object] | None = None
     ) -> list[object]:
         controls = descendants if descendants is not None else window.descendants()
         matches = []
         for control in controls:
-            try:
-                if (
-                    control.element_info.control_type in {"Button", "Text"}
-                    and self._text(control) == CHECKOUT_BUTTON_TEXT
-                ):
-                    matches.append(control)
-            except Exception:
-                continue
+            if self._is_punch_button(control, CHECKOUT_BUTTON_TEXT):
+                matches.append(control)
         return matches
 
     def _open_attendance_entry(self, window) -> bool:
@@ -631,17 +704,40 @@ class FeishuUiaAdapter:
         container_id: str,
         button_id: str,
     ) -> AttendanceSnapshot:
+        return self._build_snapshot_for_action(
+            texts,
+            buttons,
+            day=day,
+            container_id=container_id,
+            button_id=button_id,
+            action=PunchAction.CHECK_OUT,
+        )
+
+    def _build_snapshot_for_action(
+        self,
+        texts: list[str],
+        buttons: list[object],
+        *,
+        day: date,
+        container_id: str,
+        button_id: str,
+        action: PunchAction,
+    ) -> AttendanceSnapshot:
         check_in_time: time | None = None
         blocking_reason: str | None = None
         try:
             check_in_time = parse_unique_check_in_time(
-                self._check_in_source_texts(texts)
+                self._check_in_source_texts_for_action(texts, action)
             )
         except ValueError as exc:
-            blocking_reason = str(exc)
+            if action is PunchAction.CHECK_OUT or "未识别到" not in str(exc):
+                blocking_reason = str(exc)
 
         for message in BLOCKING_MESSAGES:
-            if any(message in text for text in texts):
+            if any(
+                message in text and f"不{message}" not in text
+                for text in texts
+            ):
                 blocking_reason = f"页面提示：{message}"
                 break
 
@@ -659,7 +755,23 @@ class FeishuUiaAdapter:
         if not self._has_attendance_marker(texts) or page_date != day:
             blocking_reason = "未确认当前页面为今天的考勤打卡页"
 
+        action_completed = (
+            check_in_time is not None
+            if action is PunchAction.CHECK_IN
+            else already_clocked_out
+        )
+        if (
+            action is PunchAction.CHECK_IN
+            and not action_completed
+            and blocking_reason is None
+        ):
+            if len(buttons) != 1:
+                blocking_reason = "未找到唯一的上班打卡按钮"
+            elif not enabled:
+                blocking_reason = "上班打卡按钮不可用"
+
         signature_parts = (
+            action.value,
             check_in_time.isoformat(timespec="minutes") if check_in_time else "none",
             str(already_clocked_out),
             str(len(buttons)),
@@ -680,7 +792,31 @@ class FeishuUiaAdapter:
             page_date=page_date,
             container_id=container_id,
             button_id=button_id,
+            action=action,
+            action_completed=action_completed,
         )
+
+    @classmethod
+    def _check_in_source_texts_for_action(
+        cls, texts: list[str], action: PunchAction
+    ) -> list[str]:
+        if action is PunchAction.CHECK_OUT:
+            return cls._check_in_source_texts(texts)
+        bounds = cls._independent_section_bounds(texts)
+        if bounds is None:
+            return []
+        start, end = bounds
+        section = texts[start + 1 : end]
+        normalized = [
+            text
+            for text in section
+            if text.startswith(("上班已打卡", "正常"))
+        ]
+        for text in section:
+            match = BARE_CLOCKED_PATTERN.fullmatch(text)
+            if match is not None:
+                normalized.append(f"上班已打卡 {match.group(1)}")
+        return normalized
 
     @staticmethod
     def _text(control) -> str:
@@ -864,17 +1000,23 @@ class FeishuUiaAdapter:
         return list(unique.values())
 
     @staticmethod
-    def _blocked(reason: str) -> AttendanceSnapshot:
+    def _blocked(
+        reason: str, *, action: PunchAction = PunchAction.CHECK_OUT
+    ) -> AttendanceSnapshot:
         return AttendanceSnapshot(
             check_in_time=None,
             already_clocked_out=False,
             button_count=0,
             button_enabled=False,
             blocking_reason=reason,
-            signature=hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            signature=hashlib.sha256(
+                f"{action.value}|{reason}".encode("utf-8")
+            ).hexdigest(),
             page_date=None,
             container_id="",
             button_id="",
+            action=action,
+            action_completed=False,
         )
 
     def _restore_window(self, window) -> None:

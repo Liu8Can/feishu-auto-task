@@ -27,6 +27,8 @@ class AttendanceSnapshot:
     signature: str
     container_id: str
     button_id: str
+    action: PunchAction = PunchAction.CHECK_OUT
+    action_completed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import clockout.feishu_uia as feishu_uia
+from clockout.core import PunchAction
 from clockout.feishu_uia import ClockoutClickError, FeishuUiaAdapter
 
 
@@ -430,6 +431,265 @@ def test_snapshot_extracts_unique_check_in_and_button() -> None:
     assert snapshot.page_date == date(2026, 9, 15)
     assert snapshot.container_id == "attendance-container"
     assert snapshot.button_id == "clockout-button"
+    assert snapshot.action is PunchAction.CHECK_OUT
+
+
+def test_check_in_snapshot_before_punch_has_a_valid_unique_target() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        [
+            "假勤",
+            "2026.09.15",
+            "应上班 08:50",
+            "上班打卡",
+            "应下班 18:50",
+            "下班打卡",
+        ],
+        [DummyButton()],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="checkin-target",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.action is PunchAction.CHECK_IN
+    assert not snapshot.action_completed
+    assert snapshot.check_in_time is None
+    assert snapshot.button_count == 1
+    assert snapshot.button_enabled
+    assert snapshot.blocking_reason is None
+
+
+def test_check_in_snapshot_after_punch_uses_only_check_in_record() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        [
+            "假勤",
+            "2026.09.15",
+            "应上班 08:50",
+            "已打卡 08:53",
+            "应下班 18:50",
+            "已打卡 18:52",
+        ],
+        [],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.action_completed
+    assert snapshot.check_in_time is not None
+    assert snapshot.check_in_time.strftime("%H:%M") == "08:53"
+    assert snapshot.already_clocked_out
+    assert snapshot.blocking_reason is None
+
+
+def test_check_in_context_ignores_checkout_button_and_record() -> None:
+    root = FakeControl("Window", (1,), text="假勤")
+    container = FakeControl("Document", (10,), parent=root)
+    FakeControl("Text", (11,), text="2026.09.15", parent=container)
+    FakeControl("Text", (12,), text="应上班 08:50", parent=container)
+    FakeControl("Text", (13,), text="已打卡 08:51", parent=container)
+    check_in = FakeControl("Button", (14,), text="上班打卡", parent=container)
+    FakeControl("Text", (15,), text="应下班 18:50", parent=container)
+    FakeControl("Text", (16,), text="已打卡 18:51", parent=container)
+    check_out = FakeControl("Button", (17,), text="下班打卡", parent=container)
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    context = adapter._attendance_context(
+        root,
+        date(2026, 9, 15),
+        require_trusted=False,
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert context is not None
+    assert context.buttons == [check_in]
+    assert check_out not in context.buttons
+    snapshot = adapter._build_snapshot_for_action(
+        context.texts,
+        context.buttons,
+        day=date(2026, 9, 15),
+        container_id=context.container_id,
+        button_id=context.button_id,
+        action=PunchAction.CHECK_IN,
+    )
+    assert snapshot.check_in_time is not None
+    assert snapshot.check_in_time.strftime("%H:%M") == "08:51"
+
+
+def test_check_in_snapshot_blocks_duplicate_buttons_in_check_in_section() -> None:
+    root = FakeControl("Window", (1,), text="假勤")
+    container = FakeControl("Document", (10,), parent=root)
+    FakeControl("Text", (11,), text="2026.09.15", parent=container)
+    FakeControl("Text", (12,), text="应上班 08:50", parent=container)
+    FakeControl("Button", (13,), text="上班打卡", parent=container)
+    FakeControl("Text", (14,), text="上班打卡", parent=container)
+    FakeControl("Text", (15,), text="应下班 18:50", parent=container)
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    context = adapter._attendance_context(
+        root,
+        date(2026, 9, 15),
+        require_trusted=False,
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert context is not None
+    snapshot = adapter._build_snapshot_for_action(
+        context.texts,
+        context.buttons,
+        day=date(2026, 9, 15),
+        container_id=context.container_id,
+        button_id=context.button_id,
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert not snapshot.action_completed
+    assert snapshot.button_count == 2
+    assert snapshot.blocking_reason == "未找到唯一的上班打卡按钮"
+
+
+def test_check_in_snapshot_blocks_unavailable_button() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        ["假勤", "9月15日", "应上班 08:50", "上班打卡", "应下班 18:50"],
+        [DummyButton(enabled=False)],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="checkin-target",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.button_count == 1
+    assert not snapshot.button_enabled
+    assert snapshot.blocking_reason == "上班打卡按钮不可用"
+
+
+def test_check_in_context_rejects_button_from_checkout_section() -> None:
+    root = FakeControl("Window", (1,), text="假勤")
+    container = FakeControl("Document", (10,), parent=root)
+    FakeControl("Text", (11,), text="2026.09.15", parent=container)
+    FakeControl("Text", (12,), text="应上班 08:50", parent=container)
+    FakeControl("Text", (13,), text="未打卡", parent=container)
+    FakeControl("Text", (14,), text="应下班 18:50", parent=container)
+    wrong_target = FakeControl("Button", (15,), text="上班打卡", parent=container)
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    context = adapter._attendance_context(
+        root,
+        date(2026, 9, 15),
+        require_trusted=False,
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert context is not None
+    assert wrong_target not in context.buttons
+    snapshot = adapter._build_snapshot_for_action(
+        context.texts,
+        context.buttons,
+        day=date(2026, 9, 15),
+        container_id=context.container_id,
+        button_id=context.button_id,
+        action=PunchAction.CHECK_IN,
+    )
+    assert snapshot.blocking_reason == "未找到唯一的上班打卡按钮"
+
+
+def test_check_in_snapshot_blocks_conflicting_page_dates() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        [
+            "假勤",
+            "9月14日",
+            "9月15日",
+            "应上班 08:50",
+            "上班打卡",
+            "应下班 18:50",
+        ],
+        [DummyButton()],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="checkin-target",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.page_date is None
+    assert snapshot.blocking_reason == "未确认当前页面为今天的考勤打卡页"
+
+
+def test_check_in_snapshot_preserves_page_blocking_message() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        [
+            "假勤",
+            "9月15日",
+            "应上班 08:50",
+            "上班打卡",
+            "应下班 18:50",
+            "需要人脸识别",
+        ],
+        [DummyButton()],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="checkin-target",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.blocking_reason == "页面提示：需要人脸识别"
+
+
+def test_check_in_planned_time_is_not_treated_as_completed() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        [
+            "假勤",
+            "9月15日",
+            "应上班 08:50",
+            "上班打卡 08:50",
+            "上班打卡",
+            "应下班 18:50",
+        ],
+        [DummyButton()],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="checkin-target",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.check_in_time is None
+    assert not snapshot.action_completed
+    assert snapshot.blocking_reason is None
+
+
+def test_negated_face_check_message_does_not_block_check_in() -> None:
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    snapshot = adapter._build_snapshot_for_action(
+        [
+            "假勤",
+            "9月15日",
+            "应上班 08:50",
+            "上班打卡",
+            "应下班 18:50",
+            "当前不需要人脸识别",
+        ],
+        [DummyButton()],
+        day=date(2026, 9, 15),
+        container_id="attendance-container",
+        button_id="checkin-target",
+        action=PunchAction.CHECK_IN,
+    )
+
+    assert snapshot.blocking_reason is None
+    assert not snapshot.action_completed
 
 
 def test_independent_attendance_window_snapshot_is_supported() -> None:
