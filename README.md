@@ -1,6 +1,27 @@
-# 飞书动态下班打卡助手
+<div align="center">
+  <img src="assets/app-icon.png" width="104" height="104" alt="飞书动态下班打卡助手图标">
+  <h1>飞书动态下班打卡助手</h1>
+  <p>读取实际上班时间，自动计算最早下班时间，并在 Windows 飞书桌面端完成安全打卡。</p>
 
-一款运行在 Windows 10/11 上的飞书桌面端自动化工具。程序读取当天上班打卡时间，扣除休息时段后计算最早下班时间，到点后再次核对飞书假勤页面，并完成一次下班打卡。
+  <p>
+    <a href="https://github.com/Liu8Can/feishu-auto-task/releases/latest"><img src="https://img.shields.io/github/v/release/Liu8Can/feishu-auto-task?style=flat-square&label=Release&color=0078D4" alt="最新版本"></a>
+    <a href="https://github.com/Liu8Can/feishu-auto-task/releases"><img src="https://img.shields.io/github/downloads/Liu8Can/feishu-auto-task/total?style=flat-square&label=Downloads&color=2E7D32" alt="下载次数"></a>
+    <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D4?style=flat-square&logo=windows11&logoColor=white" alt="Windows 10 和 Windows 11">
+    <img src="https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.13">
+    <a href="https://linux.do/"><img src="https://img.shields.io/badge/Community-LINUX%20DO-F59E0B?style=flat-square" alt="LINUX DO 社区"></a>
+  </p>
+
+  <p>
+    <a href="https://github.com/Liu8Can/feishu-auto-task/releases/latest"><strong>下载正式版</strong></a>
+    · <a href="#首次使用前必须完成"><strong>首次设置</strong></a>
+    · <a href="#首次试用教程"><strong>试用教程</strong></a>
+    · <a href="https://github.com/Liu8Can/feishu-auto-task/issues"><strong>问题反馈</strong></a>
+  </p>
+</div>
+
+---
+
+程序读取当天上班打卡时间，扣除休息时段后计算最早下班时间，到点后再次核对飞书假勤页面，并完成一次下班打卡。
 
 > 当前稳定版 `v1.0.0` 已实现自动下班打卡。自动上班打卡已列入 `v1.1.0` 开发计划，将沿用同等级的页面确认、防重复点击和结果核验机制。
 

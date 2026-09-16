@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "assets" / "app-icon.ico"
+PNG_OUTPUT = ROOT / "assets" / "app-icon.png"
 
 
 def main() -> None:
@@ -19,6 +20,7 @@ def main() -> None:
     draw.line((128, 128, 166, 148), fill="#202521", width=15)
     draw.ellipse((119, 119, 137, 137), fill="#202521")
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    image.save(PNG_OUTPUT)
     image.save(OUTPUT, sizes=[(16, 16), (20, 20), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 
 
