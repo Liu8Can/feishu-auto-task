@@ -13,8 +13,8 @@
 
   <p>
     <a href="https://github.com/Liu8Can/feishu-auto-task/releases/latest"><strong>下载正式版</strong></a>
-    · <a href="#首次使用前必须完成"><strong>首次设置</strong></a>
-    · <a href="#首次试用教程"><strong>试用教程</strong></a>
+    · <a href="#首次设置"><strong>首次设置</strong></a>
+    · <a href="#快速开始"><strong>试用教程</strong></a>
     · <a href="https://github.com/Liu8Can/feishu-auto-task/issues"><strong>问题反馈</strong></a>
   </p>
 </div>
@@ -24,7 +24,7 @@
 读取当天实际上班时间，自动跳过午休并计算最早下班时间；到点后重新确认页面和按钮，再完成一次下班打卡。
 
 > [!IMPORTANT]
-> 当前稳定版 `v1.0.0` 只自动处理**下班打卡**。自动上班打卡正在 `feat/auto-checkin` 分支开发，计划随 `v1.1.0` 发布。
+> 当前稳定版 `v1.0.0` 只自动处理**下班打卡**。自动上班打卡正在开发，计划随 `v1.1.0` 发布；当前尚未支持普通用户试用。
 
 ## 界面预览
 
@@ -69,11 +69,11 @@ flowchart LR
 | 桌面状态 | 到达打卡时间时保持开机、唤醒且已解锁 |
 | 页面状态 | “假勤”已固定，今天的考勤页面可正常打开 |
 
-本工具不能远程开机，也不能绕过 Windows 锁屏。睡眠或锁屏期间不会尝试点击，恢复到可交互桌面后才会继续检查。
+本工具不能远程开机，也不能绕过 Windows 锁屏。睡眠或锁屏期间不会尝试点击；恢复并解锁后，如果仍在允许检查时段内才会继续复核，超过时段只记录错过，不会补点。
 
 ## 快速开始
 
-1. 从 [最新发布页](https://github.com/Liu8Can/feishu-auto-task/releases/latest) 下载 `FeishuClockoutAssistant-v1.0.0-win-x64.zip`。
+1. 打开 [v1.0.0 发布页](https://github.com/Liu8Can/feishu-auto-task/releases/tag/v1.0.0)，下载页面中与版本号一致的 Windows 压缩包。
 2. 解压完整压缩包，双击 `FeishuClockoutAssistant.exe`。
 3. 在飞书中把“假勤”固定到左侧导航栏，并打开今天的考勤页面。
 4. 在助手的“连接”页依次点击“打开飞书假勤”和“重新绑定页面”。
@@ -81,6 +81,9 @@ flowchart LR
 6. 回到“今天”页核对上班时间与预计下班时间，保持助手在系统托盘运行。
 
 这是未签名的个人项目，Windows 可能显示来源提示。请只从本仓库发布页下载，并核对发布页中的 SHA-256 校验值。
+
+> [!TIP]
+> 首次试用建议只做固定入口、打开页面、绑定、诊断和预计时间前的“立即检查”。这些操作只读取页面和计算时间；进入允许下班时段后，“立即检查”可能执行真实打卡，请确认准备好再点击。
 
 ## 首次设置
 
