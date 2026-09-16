@@ -290,6 +290,41 @@ def test_calibration_failure_is_visible_to_user(monkeypatch) -> None:
     assert warning["message"].startswith("当前页面不是可唯一确认的今日考勤页")
 
 
+@pytest.mark.parametrize(
+    ("callback", "expected_detail"),
+    [
+        (lambda controller: controller._open_finished(False), "未能打开飞书假勤页"),
+        (
+            lambda controller: controller._open_failed("RuntimeError: 自动化超时"),
+            "打开飞书假勤失败：自动化超时",
+        ),
+    ],
+)
+def test_open_attendance_failure_explains_likely_account_and_navigation_causes(
+    monkeypatch, callback, expected_detail: str
+) -> None:
+    controller = AppController.__new__(AppController)
+    controller.window = WindowSink()
+    logged: list[tuple[object, ...]] = []
+    controller.log = lambda *args: logged.append(args)
+    warning: dict[str, str] = {}
+
+    def show_warning(parent, title: str, message: str) -> None:
+        warning.update(title=title, message=message)
+
+    monkeypatch.setattr("clockout.qt_app.QMessageBox.warning", show_warning)
+
+    callback(controller)
+
+    assert controller.window.status_message.text == expected_detail
+    assert controller.window.connection_status == "error"
+    assert "切换了飞书账号或企业" in controller.window.diagnostics_result.text
+    assert "未将“假勤”固定到飞书左侧导航栏" in controller.window.diagnostics_result.text
+    assert warning["title"] == "打开假勤失败"
+    assert warning["message"] == controller.window.diagnostics_result.text
+    assert "切换飞书账号或企业" in logged[0][0]
+
+
 def test_worker_failure_releases_active_worker_before_callback() -> None:
     controller = AppController.__new__(AppController)
     controller.busy = True

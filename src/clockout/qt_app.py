@@ -109,6 +109,13 @@ def _parse_ipc_command(payload: bytes) -> str | None:
 
 
 APP_TITLE = "飞书自动打卡助手"
+OPEN_ATTENDANCE_GUIDANCE = (
+    "可能原因：\n"
+    "1. 最近切换了飞书账号或企业，当前账号没有原来的导航配置；\n"
+    "2. 当前账号尚未将“假勤”固定到飞书左侧导航栏；\n"
+    "3. 飞书尚未登录，或页面仍在加载。\n\n"
+    "请切回正确账号，确认左侧能直接看到“假勤”，再重试。"
+)
 STATUS_TEXT = {
     "idle": "准备就绪",
     "checking": "正在检查",
@@ -1091,17 +1098,32 @@ class AppController(QObject):
         )
 
     def _open_finished(self, value: object) -> None:
-        message = "飞书假勤页已打开" if value is True else "未能打开飞书假勤页，请检查登录状态"
+        if value is not True:
+            self._show_open_attendance_failure("未能打开飞书假勤页")
+            return
+        message = "飞书假勤页已打开"
         self.window.status_message.setText(message)
-        self.window.show_connection_result(
-            message, "success" if value is True else "error"
-        )
+        self.window.show_connection_result(message, "success")
         self.log(message)
 
     def _open_failed(self, message: str) -> None:
         reason = message.split(": ", 1)[-1].strip() or "未知错误"
-        self.window.show_connection_result(f"打开飞书假勤失败：{reason}", "error")
-        self.log("打开飞书假勤失败：%s", reason)
+        self._show_open_attendance_failure(f"打开飞书假勤失败：{reason}")
+
+    def _show_open_attendance_failure(self, detail: str) -> None:
+        self.window.status_message.setText(detail)
+        self.window.show_connection_result(
+            f"{detail}\n\n{OPEN_ATTENDANCE_GUIDANCE}", "error"
+        )
+        self.log(
+            "%s；可能已切换飞书账号或企业，或当前账号未将假勤固定到左侧导航栏",
+            detail,
+        )
+        QMessageBox.warning(
+            self.window,
+            "打开假勤失败",
+            f"{detail}\n\n{OPEN_ATTENDANCE_GUIDANCE}",
+        )
 
     def calibrate(self) -> None:
         if self.busy:
