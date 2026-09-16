@@ -535,6 +535,25 @@ def test_independent_attendance_window_context_preserves_target_identity() -> No
     )
 
 
+def test_attendance_page_is_recognized_before_checkout_button_appears() -> None:
+    root = FakeControl("Window", (1,), text="假勤")
+    container = FakeControl("Document", (10,), parent=root)
+    FakeControl("Text", (11,), text="2026.09.15", parent=container)
+    FakeControl("Text", (12,), text="应上班 08:00", parent=container)
+    FakeControl("Text", (13,), text="上班打卡", parent=container)
+    FakeControl("Text", (14,), text="应下班 18:00", parent=container)
+    FakeControl("Text", (15,), text="未开始", parent=container)
+    adapter = FeishuUiaAdapter(auto_open_workbench=False)
+
+    context = adapter._attendance_context(
+        root, date(2026, 9, 15), require_trusted=False
+    )
+
+    assert context is not None
+    assert context.buttons == []
+    assert context.container_id
+
+
 def test_multiple_attendance_windows_are_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

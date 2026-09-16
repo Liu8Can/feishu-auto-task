@@ -29,6 +29,7 @@ class CheckResult:
     message: str
     check_in_time: time | None = None
     eligible_time: datetime | None = None
+    next_retry_time: datetime | None = None
 
 
 _CHECK_IN_PATTERNS = (

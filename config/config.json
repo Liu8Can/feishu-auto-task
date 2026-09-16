@@ -4,7 +4,7 @@
   "check_interval_minutes": 5,
   "check_start_time": "15:00",
   "check_end_time": "23:30",
-  "mode": "dry_run",
+  "mode": "automatic",
   "weekdays": [
     0,
     1,
@@ -13,5 +13,10 @@
     4
   ],
   "auto_open_workbench": true,
-  "trusted_container_fingerprint": ""
+  "trusted_container_fingerprint": "",
+  "calculation_mode": "dynamic",
+  "break_start_time": "12:00",
+  "break_end_time": "14:00",
+  "fixed_checkin_time": "08:50",
+  "fixed_clockout_time": "18:50"
 }

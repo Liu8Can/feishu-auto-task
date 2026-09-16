@@ -34,6 +34,11 @@ class DailyState:
     clock_out_success: bool
     attempted_at: str
     outcome: str
+    attempt_count: int = 1
+    physical_click_count: int = 0
+    next_retry_at: str = ""
+    reset_count: int = 0
+    history: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "DailyState":
@@ -44,6 +49,13 @@ class DailyState:
         success = value.get("clock_out_success", False)
         attempted_at = value["attempted_at"]
         outcome = value.get("outcome", "unknown")
+        attempt_count = value.get("attempt_count", 1 if attempted else 0)
+        physical_click_count = value.get(
+            "physical_click_count", 1 if success or outcome in {"click_failed", "unknown"} else 0
+        )
+        next_retry_at = value.get("next_retry_at", "")
+        reset_count = value.get("reset_count", 0)
+        raw_history = value.get("history", [])
         if not all(
             isinstance(item, str)
             for item in (
@@ -55,10 +67,27 @@ class DailyState:
             )
         ) or not isinstance(attempted, bool) or not isinstance(success, bool):
             raise ValueError("状态字段类型无效")
+        if (
+            isinstance(attempt_count, bool)
+            or not isinstance(attempt_count, int)
+            or attempt_count < 0
+            or isinstance(physical_click_count, bool)
+            or not isinstance(physical_click_count, int)
+            or physical_click_count < 0
+            or isinstance(reset_count, bool)
+            or not isinstance(reset_count, int)
+            or reset_count < 0
+            or not isinstance(next_retry_at, str)
+            or not isinstance(raw_history, list)
+            or any(not isinstance(item, dict) for item in raw_history)
+        ):
+            raise ValueError("状态扩展字段无效")
         date.fromisoformat(state_date)
         datetime.strptime(check_in_time, "%H:%M")
         datetime.fromisoformat(eligible_time)
         datetime.fromisoformat(attempted_at)
+        if next_retry_at:
+            datetime.fromisoformat(next_retry_at)
         return cls(
             date=state_date,
             check_in_time=check_in_time,
@@ -67,6 +96,11 @@ class DailyState:
             clock_out_success=success,
             attempted_at=attempted_at,
             outcome=outcome,
+            attempt_count=attempt_count,
+            physical_click_count=physical_click_count,
+            next_retry_at=next_retry_at,
+            reset_count=reset_count,
+            history=tuple(raw_history),
         )
 
 
@@ -89,11 +123,30 @@ class JsonStateStore:
         check_in_time: str,
         eligible_time: datetime,
         attempted_at: datetime,
+        max_attempts: int = 1,
     ) -> bool:
         with self._exclusive_lock():
             existing = self._load_unlocked(day)
-            if existing is not None and existing.clock_out_attempted:
-                return False
+            if existing is not None:
+                retryable = (
+                    existing.outcome in {"aborted_before_click", "manual_reset"}
+                    and existing.attempt_count < max_attempts
+                    and (
+                        not existing.next_retry_at
+                        or attempted_at >= datetime.fromisoformat(existing.next_retry_at)
+                    )
+                )
+                if existing.clock_out_attempted and not retryable:
+                    return False
+                attempt_count = existing.attempt_count + 1
+                reset_count = existing.reset_count
+                history = existing.history
+                physical_click_count = existing.physical_click_count
+            else:
+                attempt_count = 1
+                reset_count = 0
+                history = ()
+                physical_click_count = 0
             state = DailyState(
                 date=day.isoformat(),
                 check_in_time=check_in_time,
@@ -102,11 +155,23 @@ class JsonStateStore:
                 clock_out_success=False,
                 attempted_at=attempted_at.isoformat(timespec="seconds"),
                 outcome="attempted",
+                attempt_count=attempt_count,
+                physical_click_count=physical_click_count,
+                reset_count=reset_count,
+                history=history,
             )
             self._write_unlocked(state)
             return True
 
-    def record_outcome(self, day: date, outcome: str, *, success: bool) -> None:
+    def record_outcome(
+        self,
+        day: date,
+        outcome: str,
+        *,
+        success: bool,
+        invocation_started: bool = False,
+        next_retry_at: datetime | None = None,
+    ) -> None:
         with self._exclusive_lock():
             current = self._load_unlocked(day)
             if current is None or not current.clock_out_attempted:
@@ -120,8 +185,58 @@ class JsonStateStore:
                     clock_out_success=success,
                     attempted_at=current.attempted_at,
                     outcome=outcome,
+                    attempt_count=current.attempt_count,
+                    physical_click_count=current.physical_click_count
+                    + (1 if invocation_started else 0),
+                    next_retry_at=(
+                        next_retry_at.isoformat(timespec="seconds")
+                        if next_retry_at is not None
+                        else ""
+                    ),
+                    reset_count=current.reset_count,
+                    history=current.history,
                 )
             )
+
+    def reset_for_retry(
+        self,
+        day: date,
+        *,
+        reset_at: datetime,
+        reason: str,
+    ) -> DailyState:
+        cleaned_reason = " ".join(reason.split())
+        if not cleaned_reason:
+            raise ValueError("必须填写重置原因")
+        with self._exclusive_lock():
+            current = self._load_unlocked(day)
+            if current is None:
+                raise StateStoreError("今天没有可重置的失败记录")
+            if current.clock_out_success or current.outcome == "success":
+                raise StateStoreError("今天已经打卡成功，不能重置")
+            history_item: dict[str, object] = {
+                "reset_at": reset_at.isoformat(timespec="seconds"),
+                "reason": cleaned_reason,
+                "previous_outcome": current.outcome,
+                "attempt_count": current.attempt_count,
+                "physical_click_count": current.physical_click_count,
+            }
+            state = DailyState(
+                date=current.date,
+                check_in_time=current.check_in_time,
+                eligible_time=current.eligible_time,
+                clock_out_attempted=False,
+                clock_out_success=False,
+                attempted_at=current.attempted_at,
+                outcome="manual_reset",
+                attempt_count=current.attempt_count,
+                physical_click_count=current.physical_click_count,
+                next_retry_at="",
+                reset_count=current.reset_count + 1,
+                history=(*current.history, history_item),
+            )
+            self._write_unlocked(state)
+            return state
 
     def _load_unlocked(self, day: date) -> DailyState | None:
         if not self.path.exists():

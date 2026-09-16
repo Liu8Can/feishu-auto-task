@@ -22,7 +22,7 @@ class AppConfig:
     check_interval_minutes: int = 5
     check_start_time: str = "15:00"
     check_end_time: str = "23:30"
-    mode: str = "dry_run"
+    mode: str = "automatic"
     weekdays: tuple[int, ...] = (0, 1, 2, 3, 4)
     auto_open_workbench: bool = True
     trusted_container_fingerprint: str = ""
@@ -31,6 +31,10 @@ class AppConfig:
     break_end_time: str = "14:00"
     fixed_checkin_time: str = "08:50"
     fixed_clockout_time: str = "18:50"
+    monitor_enabled: bool = True
+    start_with_windows: bool = True
+    max_click_attempts: int = 3
+    retry_delay_minutes: int = 5
 
     def validate(self) -> AppConfig:
         if self.calculation_mode not in {"dynamic", "fixed"}:
@@ -53,6 +57,22 @@ class AppConfig:
             or not 1 <= self.check_interval_minutes <= 60
         ):
             raise ValueError("检查间隔必须在 1 到 60 分钟之间")
+        if not isinstance(self.monitor_enabled, bool):
+            raise ValueError("监控开关配置无效")
+        if not isinstance(self.start_with_windows, bool):
+            raise ValueError("开机自启动配置无效")
+        if (
+            isinstance(self.max_click_attempts, bool)
+            or not isinstance(self.max_click_attempts, int)
+            or not 1 <= self.max_click_attempts <= 5
+        ):
+            raise ValueError("自动点击尝试次数必须在 1 到 5 次之间")
+        if (
+            isinstance(self.retry_delay_minutes, bool)
+            or not isinstance(self.retry_delay_minutes, int)
+            or not 1 <= self.retry_delay_minutes <= 60
+        ):
+            raise ValueError("重试间隔必须在 1 到 60 分钟之间")
         start = _parse_time(self.check_start_time)
         end = _parse_time(self.check_end_time)
         if start > end:

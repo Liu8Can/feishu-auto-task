@@ -27,6 +27,8 @@ STATUS_LABELS = {
     "already_attempted": "今日已尝试",
     "already_clocked_out": "今日已打卡",
     "unknown": "结果不明确",
+    "retry_waiting": "等待重试",
+    "retry_exhausted": "重试已停止",
 }
 
 
@@ -254,6 +256,8 @@ class ClockoutDemoApp:
             check_start_time=self.config.start_time,
             check_end_time=self.config.end_time,
             weekdays=frozenset(self.config.weekdays),
+            max_click_attempts=self.config.max_click_attempts,
+            retry_delay_minutes=self.config.retry_delay_minutes,
         )
         return ClockoutEngine(self.adapter, self.store, config, now_provider=datetime.now)
 
@@ -489,6 +493,8 @@ class ClockoutDemoApp:
         now = datetime.now()
         if result.status == "waiting" and result.eligible_time:
             self.next_check = result.eligible_time
+        elif result.status == "retry_waiting" and result.next_retry_time:
+            self.next_check = result.next_retry_time
         elif self.running:
             self.next_check = now + timedelta(minutes=self.config.check_interval_minutes)
 

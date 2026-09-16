@@ -323,13 +323,18 @@ class FeishuUiaAdapter:
             named_count = sum(bool(self._text(control)) for control in descendants)
             page = self._attendance_page(date.today(), require_trusted=False)
             context = page[1] if page else None
+            binding_valid = bool(
+                context
+                and self.trusted_container_fingerprint
+                and context.container_id == self.trusted_container_fingerprint
+            )
             return {
                 "window_found": True,
                 "element_count": len(descendants),
                 "named_count": named_count,
                 "attendance_page": context is not None,
                 "checkout_button_count": len(context.buttons) if context else 0,
-                "bound": bool(self.trusted_container_fingerprint),
+                "bound": binding_valid,
             }
 
     def calibrate_current_page(self, day: date) -> str:
@@ -486,6 +491,7 @@ class FeishuUiaAdapter:
             control
             for control in window.descendants()
             if self._text(control) in ("考勤打卡", CHECKOUT_BUTTON_TEXT)
+            or self._text(control).startswith(("应上班", "应下班"))
             or any(pattern.search(self._text(control)) for pattern in SUCCESS_PATTERNS)
             or BARE_CLOCKED_PATTERN.fullmatch(self._text(control))
         ]
@@ -518,8 +524,6 @@ class FeishuUiaAdapter:
                     for pattern in SUCCESS_PATTERNS
                     for text in texts
                 )
-                if not buttons and not has_success:
-                    continue
                 container_runtime_id = self._runtime_identity(current, window)
                 if not container_runtime_id:
                     continue

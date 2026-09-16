@@ -6,5 +6,4 @@ if not exist ".venv\Scripts\pythonw.exe" (
   pause
   exit /b 1
 )
-set "PYTHONPATH=%CD%\src"
-start "" ".venv\Scripts\pythonw.exe" -m clockout
+start "" ".venv\Scripts\pythonw.exe" "launcher.py"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Callable, Protocol
 
 from .core import (
@@ -13,7 +13,7 @@ from .core import (
     is_workday,
     snapshots_match,
 )
-from .storage import JsonStateStore
+from .storage import DailyState, JsonStateStore
 
 
 LOGGER = logging.getLogger("clockout-demo")
@@ -44,6 +44,8 @@ class EngineConfig:
     break_end_time: time = time(14, 0)
     fixed_checkin_time: time = time(8, 50)
     fixed_clockout_time: time = time(18, 50)
+    max_click_attempts: int = 3
+    retry_delay_minutes: int = 5
 
     def __post_init__(self) -> None:
         if self.mode not in {"automatic", "dry_run"}:
@@ -62,6 +64,18 @@ class EngineConfig:
             or not 0 <= self.safety_buffer_minutes <= 180
         ):
             raise ValueError("安全缓冲必须在 0 到 180 分钟之间")
+        if (
+            isinstance(self.max_click_attempts, bool)
+            or not isinstance(self.max_click_attempts, int)
+            or not 1 <= self.max_click_attempts <= 5
+        ):
+            raise ValueError("自动点击尝试次数必须在 1 到 5 次之间")
+        if (
+            isinstance(self.retry_delay_minutes, bool)
+            or not isinstance(self.retry_delay_minutes, int)
+            or not 1 <= self.retry_delay_minutes <= 60
+        ):
+            raise ValueError("重试间隔必须在 1 到 60 分钟之间")
         if not all(
             isinstance(value, time)
             for value in (
@@ -117,7 +131,24 @@ class ClockoutEngine:
         except Exception:
             return CheckResult("blocked", "每日状态文件损坏或无法读取")
         if existing is not None and existing.clock_out_attempted:
-            return CheckResult("already_attempted", "今天已经执行过自动打卡尝试")
+            if existing.outcome == "aborted_before_click":
+                if existing.attempt_count >= self.config.max_click_attempts:
+                    return CheckResult("retry_exhausted", "点击前检查连续失败，已达到今日重试上限")
+                retry_at = (
+                    datetime.fromisoformat(existing.next_retry_at)
+                    if existing.next_retry_at
+                    else now
+                )
+                if now < retry_at:
+                    return CheckResult(
+                        "retry_waiting",
+                        "点击前检查失败，等待自动重试",
+                        next_retry_time=retry_at,
+                    )
+            elif existing.outcome in {"attempted", "click_failed", "unknown"}:
+                return self._verify_uncertain_attempt(day, existing)
+            else:
+                return CheckResult("already_attempted", "今天已经执行过自动打卡尝试")
 
         if self.config.mode == "automatic" and not self._session_is_interactive():
             return CheckResult("blocked", "Windows 当前不是可交互桌面会话")
@@ -212,6 +243,7 @@ class ClockoutEngine:
                 check_in_time=first.check_in_time.strftime("%H:%M"),
                 eligible_time=eligible_time,
                 attempted_at=final_now,
+                max_attempts=self.config.max_click_attempts,
             )
         except Exception:
             return CheckResult(
@@ -236,13 +268,20 @@ class ClockoutEngine:
             eligible_time=eligible_time,
         )
         if environment_error or not self._session_is_interactive():
-            self._record_outcome(day, "aborted_before_click", success=False)
+            retry_at = invoke_now + timedelta(minutes=self.config.retry_delay_minutes)
+            self._record_outcome(
+                day,
+                "aborted_before_click",
+                success=False,
+                next_retry_at=retry_at,
+            )
             return CheckResult(
-                "unknown",
+                "retry_waiting",
                 environment_error
-                or "点击资格已锁定，但 Windows 会话已不可交互，今天不会自动重试",
+                or "点击前环境发生变化，已安排有限重试",
                 first.check_in_time,
                 eligible_time,
+                retry_at,
             )
 
         try:
@@ -250,17 +289,30 @@ class ClockoutEngine:
         except Exception as exc:
             invocation_started = bool(getattr(exc, "invocation_started", True))
             outcome = "click_failed" if invocation_started else "aborted_before_click"
-            self._record_outcome(day, outcome, success=False)
+            retry_at = (
+                None
+                if invocation_started
+                else self._now_provider()
+                + timedelta(minutes=self.config.retry_delay_minutes)
+            )
+            self._record_outcome(
+                day,
+                outcome,
+                success=False,
+                invocation_started=invocation_started,
+                next_retry_at=retry_at,
+            )
             LOGGER.exception("下班打卡点击异常（已开始调用：%s）", invocation_started)
             return CheckResult(
-                "unknown",
+                "unknown" if invocation_started else "retry_waiting",
                 (
                     "点击调用失败，结果不明确，今天不会自动重试"
                     if invocation_started
-                    else "点击前安全检查未通过，今天不会自动重试"
+                    else "点击前安全检查未通过，已安排有限重试"
                 ),
                 first.check_in_time,
                 eligible_time,
+                retry_at,
             )
 
         try:
@@ -268,7 +320,9 @@ class ClockoutEngine:
         except Exception:
             success = False
         if not success:
-            self._record_outcome(day, "unknown", success=False)
+            self._record_outcome(
+                day, "unknown", success=False, invocation_started=True
+            )
             return CheckResult(
                 "unknown",
                 "未确认打卡成功，今天不会自动重试",
@@ -276,7 +330,7 @@ class ClockoutEngine:
                 eligible_time,
             )
 
-        self._record_outcome(day, "success", success=True)
+        self._record_outcome(day, "success", success=True, invocation_started=True)
         return CheckResult(
             "success",
             "已确认下班打卡成功",
@@ -290,15 +344,59 @@ class ClockoutEngine:
         except Exception:
             return CheckResult("blocked", "无法可靠读取飞书考勤页面")
 
+    def _verify_uncertain_attempt(
+        self, day: date, existing: DailyState
+    ) -> CheckResult:
+        if not self._session_is_interactive():
+            return CheckResult("unknown", "此前点击结果不明确，解锁后将继续核验飞书页面")
+        snapshot = self._read_snapshot(day)
+        eligible_time = datetime.fromisoformat(existing.eligible_time)
+        check_in_time = time.fromisoformat(existing.check_in_time)
+        if isinstance(snapshot, CheckResult):
+            return CheckResult(
+                "unknown",
+                "此前点击结果不明确，暂未能重新读取飞书页面",
+                check_in_time,
+                eligible_time,
+            )
+        if snapshot.page_date == day and snapshot.already_clocked_out:
+            self._record_outcome(day, "success", success=True)
+            return CheckResult(
+                "already_clocked_out",
+                "已从飞书页面确认今天下班打卡成功",
+                check_in_time,
+                eligible_time,
+            )
+        return CheckResult(
+            "unknown",
+            "此前点击结果不明确；飞书尚未显示下班记录，不会自动重复点击",
+            check_in_time,
+            eligible_time,
+        )
+
     def _session_is_interactive(self) -> bool:
         try:
             return self.adapter.is_session_interactive()
         except Exception:
             return False
 
-    def _record_outcome(self, day: date, outcome: str, *, success: bool) -> None:
+    def _record_outcome(
+        self,
+        day: date,
+        outcome: str,
+        *,
+        success: bool,
+        invocation_started: bool = False,
+        next_retry_at: datetime | None = None,
+    ) -> None:
         try:
-            self.store.record_outcome(day, outcome, success=success)
+            self.store.record_outcome(
+                day,
+                outcome,
+                success=success,
+                invocation_started=invocation_started,
+                next_retry_at=next_retry_at,
+            )
         except Exception:
             # The durable attempted flag was written before clicking, so retry stays blocked.
             pass
@@ -347,21 +445,25 @@ class ClockoutEngine:
                 snapshot.check_in_time,
                 eligible_time,
             )
-        if snapshot.button_count != 1 or not snapshot.button_enabled:
+        if now >= eligible_time and (
+            snapshot.button_count != 1 or not snapshot.button_enabled
+        ):
             return CheckResult(
                 "blocked",
                 "未找到唯一且可用的下班打卡按钮",
                 snapshot.check_in_time,
                 eligible_time,
             )
-        if not snapshot.signature:
+        if now >= eligible_time and not snapshot.signature:
             return CheckResult(
                 "blocked",
                 "页面快照缺少一致性标识",
                 snapshot.check_in_time,
                 eligible_time,
             )
-        if not snapshot.container_id or not snapshot.button_id:
+        if now >= eligible_time and (
+            not snapshot.container_id or not snapshot.button_id
+        ):
             return CheckResult(
                 "blocked",
                 "考勤页面或下班按钮缺少稳定身份标识",

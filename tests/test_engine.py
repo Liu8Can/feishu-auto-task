@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from threading import Barrier
 from typing import Callable
@@ -98,6 +98,26 @@ def make_engine(
 
 def test_before_dynamic_target_waits_without_clicking(tmp_path: object) -> None:
     adapter = FakeAdapter([valid_snapshot()])
+    engine, store = make_engine(tmp_path, adapter)
+
+    result = engine.check(datetime(2026, 9, 15, 17, 4))
+
+    assert result.status == "waiting"
+    assert result.eligible_time == datetime(2026, 9, 15, 17, 5)
+    assert adapter.click_calls == 0
+    assert store.load(datetime(2026, 9, 15).date()) is None
+
+
+def test_before_target_does_not_require_checkout_button_yet(tmp_path: object) -> None:
+    adapter = FakeAdapter(
+        [
+            valid_snapshot(
+                button_count=0,
+                button_enabled=False,
+                button_id="",
+            )
+        ]
+    )
     engine, store = make_engine(tmp_path, adapter)
 
     result = engine.check(datetime(2026, 9, 15, 17, 4))
@@ -296,7 +316,7 @@ def test_unknown_result_is_never_retried_that_day(tmp_path: object) -> None:
     state = store.load(now.date())
 
     assert first_result.status == "unknown"
-    assert second_result.status == "already_attempted"
+    assert second_result.status == "unknown"
     assert adapter.click_calls == 1
     assert adapter.snapshot_calls == 2
     assert state is not None
@@ -312,7 +332,7 @@ def test_click_exception_is_never_retried_that_day(tmp_path: object) -> None:
     engine, _ = make_engine(tmp_path, adapter, mode="automatic")
 
     assert engine.check(now).status == "unknown"
-    assert engine.check(now.replace(hour=18)).status == "already_attempted"
+    assert engine.check(now.replace(hour=18)).status == "unknown"
     assert adapter.click_calls == 1
 
 
@@ -334,8 +354,9 @@ def test_preclick_exception_records_distinct_outcome(tmp_path: object) -> None:
     result = engine.check(now)
     state = store.load(now.date())
 
-    assert result.status == "unknown"
+    assert result.status == "retry_waiting"
     assert "点击前安全检查未通过" in result.message
+    assert result.next_retry_time == now + timedelta(minutes=5)
     assert state is not None
     assert state.outcome == "aborted_before_click"
 
@@ -411,7 +432,7 @@ def test_time_is_checked_again_after_claim(tmp_path: object) -> None:
     result = engine.check(initial)
     state = store.load(initial.date())
 
-    assert result.status == "unknown"
+    assert result.status == "retry_waiting"
     assert adapter.click_calls == 0
     assert state is not None
     assert state.outcome == "aborted_before_click"
@@ -430,10 +451,69 @@ def test_session_is_checked_again_after_claim(tmp_path: object) -> None:
     result = engine.check(initial)
     state = store.load(initial.date())
 
-    assert result.status == "unknown"
+    assert result.status == "retry_waiting"
     assert adapter.click_calls == 0
     assert state is not None
     assert state.outcome == "aborted_before_click"
+
+
+def test_preclick_failure_retries_after_delay_and_then_succeeds(tmp_path: object) -> None:
+    class PreclickError(RuntimeError):
+        invocation_started = False
+
+    now = datetime(2026, 9, 15, 17, 5)
+    snapshot = valid_snapshot()
+    adapter = FakeAdapter([snapshot, snapshot, snapshot, snapshot], now=now)
+    original_click = adapter.click_clock_out
+    calls = 0
+
+    def fail_once(expected_signature: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            adapter.click_calls += 1
+            raise PreclickError("foreground changed")
+        original_click(expected_signature)
+
+    adapter.click_clock_out = fail_once  # type: ignore[method-assign]
+    engine, store = make_engine(tmp_path, adapter, mode="automatic")
+
+    first = engine.check(now)
+    early = engine.check(now + timedelta(minutes=4))
+    adapter.now = now + timedelta(minutes=5)
+    second = engine.check(now + timedelta(minutes=5))
+    state = store.load(now.date())
+
+    assert first.status == "retry_waiting"
+    assert early.status == "retry_waiting"
+    assert second.status == "success"
+    assert adapter.click_calls == 2
+    assert state is not None
+    assert state.attempt_count == 2
+    assert state.physical_click_count == 1
+
+
+def test_uncertain_result_is_only_verified_and_never_clicked_twice(tmp_path: object) -> None:
+    now = datetime(2026, 9, 15, 17, 5)
+    before = valid_snapshot()
+    after = valid_snapshot(
+        already_clocked_out=True,
+        button_count=0,
+        button_enabled=False,
+        button_id="",
+        signature="confirmed",
+    )
+    adapter = FakeAdapter([before, before, after], verify_result=False, now=now)
+    engine, store = make_engine(tmp_path, adapter, mode="automatic")
+
+    first = engine.check(now)
+    verified = engine.check(now + timedelta(minutes=5))
+    state = store.load(now.date())
+
+    assert first.status == "unknown"
+    assert verified.status == "already_clocked_out"
+    assert adapter.click_calls == 1
+    assert state is not None and state.clock_out_success
 
 
 def test_corrupt_state_blocks_without_reading_page(tmp_path: object) -> None:
