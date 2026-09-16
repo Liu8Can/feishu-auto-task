@@ -52,7 +52,18 @@ def test_manual_reset_preserves_history_and_never_resets_success(tmp_path: objec
         eligible_time=moment,
         attempted_at=moment,
     )
-    store.record_outcome(day, "click_failed", success=False, invocation_started=True)
+    state = store.load(day)
+    assert state is not None
+    checkout = state.action("check_out")
+    assert checkout is not None
+    store.record_action_outcome(
+        day,
+        "check_out",
+        checkout.claim_token,
+        "click_failed",
+        success=False,
+        invocation_started=True,
+    )
 
     reset = store.reset_for_retry(
         day,
@@ -70,7 +81,18 @@ def test_manual_reset_preserves_history_and_never_resets_success(tmp_path: objec
         attempted_at=moment + timedelta(minutes=3),
         max_attempts=3,
     )
-    store.record_outcome(day, "success", success=True, invocation_started=True)
+    state = store.load(day)
+    assert state is not None
+    checkout = state.action("check_out")
+    assert checkout is not None
+    store.record_action_outcome(
+        day,
+        "check_out",
+        checkout.claim_token,
+        "success",
+        success=True,
+        invocation_started=True,
+    )
     with pytest.raises(Exception, match="不能重置"):
         store.reset_for_retry(
             day,

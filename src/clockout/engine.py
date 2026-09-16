@@ -8,6 +8,7 @@ from typing import Callable, Protocol
 from .core import (
     AttendanceSnapshot,
     CheckResult,
+    PunchAction,
     calculate_eligible_time,
     is_within_window,
     is_workday,
@@ -238,8 +239,9 @@ class ClockoutEngine:
             )
 
         try:
-            claimed = self.store.claim_attempt(
+            claim_token = self.store.claim_action(
                 day,
+                PunchAction.CHECK_OUT,
                 check_in_time=first.check_in_time.strftime("%H:%M"),
                 eligible_time=eligible_time,
                 attempted_at=final_now,
@@ -252,7 +254,7 @@ class ClockoutEngine:
                 first.check_in_time,
                 eligible_time,
             )
-        if not claimed:
+        if not claim_token:
             return CheckResult(
                 "already_attempted",
                 "今天已经执行过自动打卡尝试",
@@ -271,6 +273,7 @@ class ClockoutEngine:
             retry_at = invoke_now + timedelta(minutes=self.config.retry_delay_minutes)
             self._record_outcome(
                 day,
+                claim_token,
                 "aborted_before_click",
                 success=False,
                 next_retry_at=retry_at,
@@ -297,6 +300,7 @@ class ClockoutEngine:
             )
             self._record_outcome(
                 day,
+                claim_token,
                 outcome,
                 success=False,
                 invocation_started=invocation_started,
@@ -321,7 +325,11 @@ class ClockoutEngine:
             success = False
         if not success:
             self._record_outcome(
-                day, "unknown", success=False, invocation_started=True
+                day,
+                claim_token,
+                "unknown",
+                success=False,
+                invocation_started=True,
             )
             return CheckResult(
                 "unknown",
@@ -330,7 +338,9 @@ class ClockoutEngine:
                 eligible_time,
             )
 
-        self._record_outcome(day, "success", success=True, invocation_started=True)
+        self._record_outcome(
+            day, claim_token, "success", success=True, invocation_started=True
+        )
         return CheckResult(
             "success",
             "已确认下班打卡成功",
@@ -360,7 +370,11 @@ class ClockoutEngine:
                 eligible_time,
             )
         if snapshot.page_date == day and snapshot.already_clocked_out:
-            self._record_outcome(day, "success", success=True)
+            checkout = existing.action(PunchAction.CHECK_OUT)
+            if checkout is not None:
+                self._record_outcome(
+                    day, checkout.claim_token, "success", success=True
+                )
             return CheckResult(
                 "already_clocked_out",
                 "已从飞书页面确认今天下班打卡成功",
@@ -383,6 +397,7 @@ class ClockoutEngine:
     def _record_outcome(
         self,
         day: date,
+        claim_token: str,
         outcome: str,
         *,
         success: bool,
@@ -390,8 +405,10 @@ class ClockoutEngine:
         next_retry_at: datetime | None = None,
     ) -> None:
         try:
-            self.store.record_outcome(
+            self.store.record_action_outcome(
                 day,
+                PunchAction.CHECK_OUT,
+                claim_token,
                 outcome,
                 success=success,
                 invocation_started=invocation_started,
