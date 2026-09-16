@@ -40,6 +40,7 @@ class AppConfig:
     start_with_windows: bool = True
     max_click_attempts: int = 3
     retry_delay_minutes: int = 5
+    theme_mode: str = "system"
     # Constructor-only compatibility for callers that still use the v1 names.
     check_start_time: str | None = None
     check_end_time: str | None = None
@@ -75,6 +76,8 @@ class AppConfig:
             raise ValueError("上班自动打卡开关配置无效")
         if not isinstance(self.auto_check_out_enabled, bool):
             raise ValueError("下班自动打卡开关配置无效")
+        if self.theme_mode not in {"system", "light", "dark"}:
+            raise ValueError("界面主题只能是 system、light 或 dark")
         if (
             isinstance(self.max_click_attempts, bool)
             or not isinstance(self.max_click_attempts, int)

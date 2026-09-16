@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time as wall_time
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 import clockout.qt_app as qt_app
 from clockout.config import AppConfig
-from clockout.core import AttendanceSnapshot, CheckResult
+from clockout.core import AttendanceSnapshot, CheckResult, PunchAction
 from clockout.qt_app import AppController
 
 
@@ -604,3 +604,421 @@ def test_today_preview_uses_real_check_in_time_for_display() -> None:
     assert shown[0].eligible_time == datetime.combine(date.today(), time(18, 36))
     assert "08:31" in shown[0].message
     assert "18:36" in shown[0].message
+
+
+def test_engine_receives_both_action_switches_and_windows() -> None:
+    controller = AppController.__new__(AppController)
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=False,
+        check_in_window_start="06:30",
+        check_in_window_end="10:15",
+        check_out_window_start="16:10",
+        check_out_window_end="22:45",
+    )
+    controller.adapter = object()
+    controller.store = object()
+
+    config = controller._engine().config
+
+    assert config.auto_check_in_enabled
+    assert not config.auto_check_out_enabled
+    assert config.check_in_start_time == time(6, 30)
+    assert config.check_in_end_time == time(10, 15)
+    assert config.check_start_time == time(16, 10)
+    assert config.check_end_time == time(22, 45)
+
+
+def test_schedule_keeps_checkout_after_checkin_completed() -> None:
+    controller = AppController.__new__(AppController)
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=True,
+        check_in_window_start="07:00",
+        check_in_window_end="11:00",
+        check_out_window_start="15:00",
+        check_out_window_end="23:30",
+    )
+    completed = SimpleNamespace(
+        success=True,
+        outcome="success",
+        attempt_count=1,
+        next_retry_at="",
+    )
+    state = SimpleNamespace(
+        action=lambda action: completed if action is PunchAction.CHECK_IN else None
+    )
+    controller.store = SimpleNamespace(load=lambda day: state)
+    controller.window = SimpleNamespace(next_value=TextSink())
+
+    controller._schedule_from(datetime(2026, 9, 16, 12, 0))
+
+    assert controller.next_action is PunchAction.CHECK_OUT
+    assert controller.next_check == datetime(2026, 9, 16, 15, 0)
+
+
+@pytest.mark.parametrize(
+    "checkin_state",
+    [
+        SimpleNamespace(
+            success=False,
+            outcome="aborted_before_click",
+            attempt_count=1,
+            next_retry_at="2026-09-16T16:05:00",
+        ),
+        SimpleNamespace(
+            success=False,
+            outcome="unknown",
+            attempt_count=1,
+            next_retry_at="",
+        ),
+        SimpleNamespace(
+            success=False,
+            outcome="aborted_before_click",
+            attempt_count=3,
+            next_retry_at="2026-09-16T15:55:00",
+        ),
+    ],
+)
+def test_due_checkout_is_not_blocked_by_checkin_retry_state(checkin_state) -> None:
+    controller = AppController.__new__(AppController)
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=True,
+        check_in_window_start="07:00",
+        check_in_window_end="18:00",
+        check_out_window_start="15:00",
+        check_out_window_end="23:30",
+        max_click_attempts=3,
+    )
+    state = SimpleNamespace(
+        action=lambda action: checkin_state
+        if action is PunchAction.CHECK_IN
+        else None
+    )
+    controller.store = SimpleNamespace(load=lambda day: state)
+    controller.window = SimpleNamespace(next_value=TextSink())
+
+    controller._schedule_from(datetime(2026, 9, 16, 16, 0))
+
+    assert controller.next_action is PunchAction.CHECK_OUT
+    assert controller.next_check == datetime(2026, 9, 16, 16, 0)
+
+
+def test_exhausted_checkin_is_not_revived_after_reschedule() -> None:
+    controller = AppController.__new__(AppController)
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=True,
+        check_in_window_end="18:00",
+        check_out_window_start="15:00",
+        max_click_attempts=3,
+    )
+    exhausted = SimpleNamespace(
+        success=False,
+        outcome="aborted_before_click",
+        attempt_count=3,
+        next_retry_at="2026-09-16T08:00:00",
+    )
+    state = SimpleNamespace(
+        action=lambda action: exhausted
+        if action is PunchAction.CHECK_IN
+        else None
+    )
+    controller.store = SimpleNamespace(load=lambda day: state)
+    controller.window = SimpleNamespace(next_value=TextSink())
+
+    controller._schedule_from(datetime(2026, 9, 16, 9, 0))
+
+    assert controller.next_action is PunchAction.CHECK_OUT
+    assert controller.next_check == datetime(2026, 9, 16, 15, 0)
+
+
+def test_deferred_checkin_does_not_starve_due_checkout_in_overlap() -> None:
+    controller = AppController.__new__(AppController)
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=True,
+        check_in_window_start="07:00",
+        check_in_window_end="18:00",
+        check_out_window_start="15:00",
+        check_out_window_end="23:30",
+    )
+    controller.store = SimpleNamespace(load=lambda day: None)
+    controller.window = SimpleNamespace(next_value=TextSink())
+    now = datetime(2026, 9, 16, 15, 0)
+
+    controller._schedule_from(
+        now,
+        eligible_at_by_action={
+            PunchAction.CHECK_IN: datetime(2026, 9, 16, 15, 5)
+        },
+    )
+
+    assert controller.next_action is PunchAction.CHECK_OUT
+    assert controller.next_check == now
+
+
+def test_retry_past_window_end_moves_to_next_workday_without_busy_loop() -> None:
+    controller = AppController.__new__(AppController)
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=False,
+        check_in_window_start="07:00",
+        check_in_window_end="11:00",
+    )
+    controller.store = SimpleNamespace(load=lambda day: None)
+    controller.window = SimpleNamespace(next_value=TextSink())
+    now = datetime(2026, 9, 16, 10, 59)
+
+    controller._schedule_from(
+        now,
+        eligible_at_by_action={
+            PunchAction.CHECK_IN: datetime(2026, 9, 16, 11, 4)
+        },
+    )
+
+    assert controller.next_action is PunchAction.CHECK_IN
+    assert controller.next_check == datetime(2026, 9, 17, 7, 0)
+
+
+@pytest.mark.parametrize(
+    ("status", "has_next_retry"),
+    [
+        ("retry_waiting", True),
+        ("unknown", False),
+        ("retry_exhausted", False),
+    ],
+)
+def test_checkin_result_does_not_override_due_checkout(
+    status: str, has_next_retry: bool
+) -> None:
+    controller = AppController.__new__(AppController)
+    controller.busy = True
+    controller._running_action = PunchAction.CHECK_IN
+    controller.config = AppConfig(check_interval_minutes=5)
+    controller._show_result = lambda *args: None
+    scheduled_at: list[datetime] = []
+
+    def schedule(now: datetime, **kwargs) -> None:
+        scheduled_at.append(now)
+        controller.next_action = PunchAction.CHECK_OUT
+        controller.next_check = now
+
+    controller._schedule_from = schedule
+    controller._update_next_label = lambda: None
+    controller.tray = TraySink()
+    next_retry = (
+        datetime.now() + timedelta(minutes=5) if has_next_retry else None
+    )
+
+    controller._check_finished(
+        CheckResult(status, "测试状态", next_retry_time=next_retry)
+    )
+
+    assert controller.next_action is PunchAction.CHECK_OUT
+    assert controller.next_check == scheduled_at[0]
+
+
+def test_run_check_now_passes_scheduled_action_to_engine() -> None:
+    controller = AppController.__new__(AppController)
+    controller.busy = False
+    controller.next_action = None
+    controller.next_check = None
+    checked: list[tuple[PunchAction, datetime]] = []
+    shown: list[tuple[CheckResult, PunchAction | None]] = []
+    started: dict[str, object] = {}
+
+    class EngineSink:
+        def check(self, action: PunchAction, now: datetime) -> CheckResult:
+            checked.append((action, now))
+            return CheckResult("success", "完成")
+
+    def schedule(now: datetime, *, immediate: bool = False, **kwargs) -> None:
+        controller.next_action = PunchAction.CHECK_IN
+        controller.next_check = now
+
+    def start_worker(function, callback, error_callback, task_name) -> None:
+        started.update(
+            function=function,
+            callback=callback,
+            error_callback=error_callback,
+            task_name=task_name,
+        )
+
+    controller._schedule_from = schedule
+    controller._engine = EngineSink
+    controller._show_result = lambda result, action=None: shown.append((result, action))
+    controller._start_worker = start_worker
+    controller.log = lambda *args: None
+
+    controller.run_check_now()
+    result = started["function"]()  # type: ignore[operator]
+
+    assert checked[0][0] is PunchAction.CHECK_IN
+    assert isinstance(checked[0][1], datetime)
+    assert isinstance(result, CheckResult)
+    assert shown[-1][1] is PunchAction.CHECK_IN
+
+
+def test_due_unknown_checkin_runs_without_sliding_the_verification_time(
+    monkeypatch,
+) -> None:
+    controller = AppController.__new__(AppController)
+    controller.busy = False
+    controller.config = AppConfig(
+        auto_check_in_enabled=True,
+        auto_check_out_enabled=False,
+        check_in_window_start="07:00",
+        check_in_window_end="11:00",
+        check_interval_minutes=5,
+    )
+    unknown = SimpleNamespace(
+        success=False,
+        outcome="unknown",
+        attempt_count=1,
+        next_retry_at="",
+    )
+    state = SimpleNamespace(
+        action=lambda action: unknown
+        if action is PunchAction.CHECK_IN
+        else None
+    )
+    controller.store = SimpleNamespace(load=lambda day: state)
+    controller.window = SimpleNamespace(next_value=TextSink())
+    checked: list[tuple[PunchAction, datetime]] = []
+    started: dict[str, object] = {}
+
+    class EngineSink:
+        def check(self, action: PunchAction, now: datetime) -> CheckResult:
+            checked.append((action, now))
+            return CheckResult("unknown", "继续核验")
+
+    def start_worker(function, callback, error_callback, task_name) -> None:
+        started["function"] = function
+
+    controller._engine = EngineSink
+    controller._show_result = lambda *args: None
+    controller._start_worker = start_worker
+    controller.log = lambda *args: None
+    controller._schedule_from(datetime(2026, 9, 16, 9, 0))
+    assert controller.next_check == datetime(2026, 9, 16, 9, 5)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 16, 9, 5)
+
+    monkeypatch.setattr(qt_app, "datetime", FrozenDateTime)
+    controller.run_check_now()
+    result = started["function"]()  # type: ignore[operator]
+
+    assert checked == [
+        (PunchAction.CHECK_IN, FrozenDateTime(2026, 9, 16, 9, 5))
+    ]
+    assert isinstance(result, CheckResult)
+
+
+def test_reset_applies_only_to_requested_action(monkeypatch) -> None:
+    controller = AppController.__new__(AppController)
+    controller.window = WindowSink()
+    reset_calls: list[tuple[date, PunchAction, str]] = []
+    controller.store = SimpleNamespace(
+        reset_action_for_retry=lambda day, action, reset_at, reason: reset_calls.append(
+            (day, action, reason)
+        )
+    )
+    controller.log = lambda *args: None
+    controller._schedule_from = lambda *args, **kwargs: None
+    shown: list[tuple[CheckResult, PunchAction | None]] = []
+    controller._show_result = lambda result, action=None: shown.append((result, action))
+    monkeypatch.setattr(
+        qt_app.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: qt_app.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        qt_app.QInputDialog,
+        "getText",
+        lambda *args, **kwargs: ("人工确认没有上班记录", True),
+    )
+    snapshot = AttendanceSnapshot(
+        page_date=date.today(),
+        check_in_time=None,
+        already_clocked_out=False,
+        button_count=1,
+        button_enabled=True,
+        blocking_reason=None,
+        signature="check-in",
+        container_id="attendance",
+        button_id="check-in-button",
+        action=PunchAction.CHECK_IN,
+        action_completed=False,
+    )
+
+    controller._reset_snapshot_ready(PunchAction.CHECK_IN, snapshot)
+
+    assert reset_calls == [
+        (date.today(), PunchAction.CHECK_IN, "人工确认没有上班记录")
+    ]
+    assert shown[-1][1] is PunchAction.CHECK_IN
+
+
+def test_main_window_exposes_dual_action_rules_and_keyboard_focus() -> None:
+    script = r'''
+from pathlib import Path
+from types import SimpleNamespace
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QAbstractButton, QApplication
+
+from clockout.config import AppConfig
+from clockout.qt_app import MainWindow
+from clockout.ui import install_theme, theme_qss, theme_tokens
+
+app = QApplication([])
+noop = lambda *args, **kwargs: None
+manager = install_theme(app, "light")
+controller = SimpleNamespace(
+    config=AppConfig(),
+    theme_manager=manager,
+    paths=SimpleNamespace(log_dir=Path.cwd()),
+    set_monitor_enabled=noop,
+    run_check_now=noop,
+    open_attendance=noop,
+    calibrate=noop,
+    request_reset=noop,
+    diagnose=noop,
+    save_settings=noop,
+)
+window = MainWindow(controller)
+assert window.auto_check_in.text() == "启用上班自动打卡"
+assert window.auto_check_out.text() == "启用下班自动打卡"
+assert window.check_in_start.time().toString("HH:mm") == "07:00"
+assert window.check_out_end.time().toString("HH:mm") == "23:30"
+assert window.theme_mode.currentData() == "system"
+assert window.check_in_row.title_label.text() == "上班自动打卡"
+assert window.check_out_row.title_label.text() == "下班自动打卡"
+assert all(button.focusPolicy() == Qt.FocusPolicy.StrongFocus for button in window.findChildren(QAbstractButton))
+manager.set_mode("dark")
+assert app.styleSheet() == theme_qss(theme_tokens("dark", app))
+assert "#17181b" in app.styleSheet()
+manager.set_mode("light")
+assert app.styleSheet() == theme_qss(theme_tokens("light", app))
+'''
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    project_source = str((Path(__file__).resolve().parents[1] / "src"))
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [project_source, environment.get("PYTHONPATH", "")]
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QFontDatabase, QPalette
 from PySide6.QtWidgets import QAbstractButton, QApplication, QWidget
 
 
@@ -103,6 +105,17 @@ _DARK = ThemeTokens(
 )
 
 
+def _ensure_windows_cjk_font() -> None:
+    if sys.platform != "win32":
+        return
+    available = set(QFontDatabase.families())
+    if {"Microsoft YaHei UI", "Microsoft YaHei"} & available:
+        return
+    font_path = Path("C:/Windows/Fonts/msyh.ttc")
+    if font_path.is_file():
+        QFontDatabase.addApplicationFont(str(font_path))
+
+
 def _coerce_mode(mode: ThemeMode | str) -> ThemeMode:
     try:
         return ThemeMode(mode)
@@ -163,10 +176,38 @@ def theme_qss(tokens: ThemeTokens) -> str:
     return f"""
 QWidget {{
     color: {tokens.text};
-    font-family: "Segoe UI Variable", "Microsoft YaHei UI", "Segoe UI";
+    font-family: "Microsoft YaHei UI", "Segoe UI Variable", "Segoe UI";
     font-size: 14px;
 }}
 QMainWindow, QDialog, QMessageBox, QWidget#root {{ background: {tokens.canvas}; }}
+QScrollArea {{ border: 0; background: {tokens.canvas}; }}
+QFrame#topbar {{ background: {tokens.surface}; border-bottom: 1px solid {tokens.border}; }}
+QFrame#tabs {{ background: {tokens.canvas}; border: 0; }}
+QLabel#brand {{ font-size: 17px; font-weight: 700; color: {tokens.text}; }}
+QLabel#eyebrow, QLabel#pageSubtitle, QLabel#small {{ color: {tokens.text_muted}; }}
+QLabel#eyebrow, QLabel#small {{ font-size: 12px; }}
+QLabel#pageTitle {{ font-size: 24px; font-weight: 700; color: {tokens.text}; }}
+QLabel#pageSubtitle {{ font-size: 13px; }}
+QLabel#statusTitle {{ font-size: 23px; font-weight: 700; color: {tokens.text}; }}
+QLabel#statusMessage {{ color: {tokens.text_muted}; }}
+QLabel#metricValue {{ font-size: 22px; font-weight: 700; color: {tokens.text}; }}
+QLabel#metricLabel {{ color: {tokens.text_subtle}; font-size: 12px; font-weight: 600; }}
+QLabel#sectionTitle {{ font-size: 15px; font-weight: 700; color: {tokens.text}; }}
+QLabel#warning {{ color: {tokens.warning}; background: {tokens.warning_soft}; border: 1px solid {tokens.warning}; border-radius: 8px; padding: 10px 12px; }}
+QFrame#statusPanel {{ background: {tokens.surface}; border: 1px solid {tokens.border}; border-radius: 8px; }}
+QFrame#metricCell {{ border-right: 1px solid {tokens.border}; }}
+QPushButton#nav {{ min-width: 82px; padding: 8px 16px; border: 0; border-radius: 8px; color: {tokens.text_muted}; background: transparent; font-weight: 600; }}
+QPushButton#nav:hover {{ background: {tokens.surface_muted}; color: {tokens.text}; }}
+QPushButton#nav:checked {{ background: {tokens.surface}; color: {tokens.accent}; font-weight: 700; }}
+QPushButton#primary {{ color: #ffffff; background: {tokens.accent}; border-color: {tokens.accent}; font-weight: 700; }}
+QPushButton#primary:hover {{ background: {tokens.accent_hover}; border-color: {tokens.accent_hover}; }}
+QPushButton#primary:pressed {{ background: {tokens.accent_pressed}; border-color: {tokens.accent_pressed}; }}
+QPushButton#secondary {{ background: {tokens.surface}; color: {tokens.text}; border-color: {tokens.border_strong}; }}
+QPushButton#danger {{ background: transparent; color: {tokens.error}; border-color: {tokens.error}; }}
+QTextEdit#diagnostics[status="neutral"] {{ background: {tokens.surface}; color: {tokens.text}; border-color: {tokens.border_strong}; }}
+QTextEdit#diagnostics[status="running"] {{ background: {tokens.accent_soft}; color: {tokens.accent}; border-color: {tokens.accent}; }}
+QTextEdit#diagnostics[status="success"] {{ background: {tokens.success_soft}; color: {tokens.success}; border-color: {tokens.success}; }}
+QTextEdit#diagnostics[status="error"] {{ background: {tokens.error_soft}; color: {tokens.error}; border-color: {tokens.error}; }}
 QFrame[uiSurface="true"] {{
     background: {tokens.surface};
     border: 1px solid {tokens.border};
@@ -242,6 +283,7 @@ class ThemeManager(QObject):
         super().__init__(app)
         self._app = app
         self._mode = _coerce_mode(mode)
+        _ensure_windows_cjk_font()
         signal = getattr(app.styleHints(), "colorSchemeChanged", None)
         if signal is not None:
             signal.connect(self._system_theme_changed)

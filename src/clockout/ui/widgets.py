@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -154,7 +155,10 @@ class TimelineRow(QFrame):
         layout.addWidget(self.marker, 0, Qt.AlignmentFlag.AlignTop)
         self.time_label = QLabel(time_text)
         self.time_label.setProperty("uiMuted", True)
-        self.time_label.setFixedWidth(58)
+        time_metrics = QFontMetrics(self.time_label.font())
+        self.time_label.setFixedWidth(
+            time_metrics.horizontalAdvance("00:00-00:00") + 8
+        )
         layout.addWidget(self.time_label, 0, Qt.AlignmentFlag.AlignTop)
         text_layout = QVBoxLayout()
         text_layout.setSpacing(2)

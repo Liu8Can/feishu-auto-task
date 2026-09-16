@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from clockout.ui import (
@@ -29,17 +31,21 @@ def test_theme_tokens_resolve_explicit_modes() -> None:
 def test_theme_qss_covers_focus_and_overlay_surfaces() -> None:
     qss = theme_qss(theme_tokens("light"))
 
+    assert qss.index('"Microsoft YaHei UI"') < qss.index('"Segoe UI Variable"')
     assert "QPushButton:focus" in qss
     assert "border: 2px solid" in qss
     assert "QMenu" in qss
     assert "QToolTip" in qss
     assert "QDialog" in qss
     assert "outline: 0" in qss
+    assert 'QTextEdit#diagnostics[status="error"]' in qss
+    assert "QPushButton#nav:checked" in qss
 
 
 def test_qt_theme_and_components_in_isolated_application() -> None:
     script = r'''
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QApplication, QPushButton
 from clockout.ui import (
     DiagnosticRow,
@@ -71,6 +77,7 @@ pill = StatusPill("正常", SemanticStatus.SUCCESS)
 feedback = FeedbackBar("绑定成功", "已识别今天的假勤页面", "success")
 diagnostic = DiagnosticRow("飞书窗口", "已找到", status_text="正常", status="success")
 timeline = TimelineRow("08:30", "上班打卡", "已经确认", status="success")
+assert timeline.time_label.width() >= QFontMetrics(timeline.time_label.font()).horizontalAdvance("00:00-00:00")
 pill.set_status("warning")
 feedback.set_feedback("需要确认", "请打开今天的假勤页面", "warning")
 diagnostic.set_result("未找到", "失败", "error", detail="飞书未启动")
@@ -89,6 +96,39 @@ except ValueError as exc:
     assert "未知语义状态" in str(exc)
 else:
     raise AssertionError("unknown status must be rejected")
+'''
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_windows_cjk_font_is_registered_for_offscreen_qt() -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows 字体注册仅适用于 Windows")
+    script = r'''
+from PySide6.QtGui import QFont, QFontDatabase, QFontMetrics
+from PySide6.QtWidgets import QApplication
+from clockout.ui import install_theme
+
+app = QApplication([])
+install_theme(app, "light")
+families = QFontDatabase.families()
+assert "Microsoft YaHei UI" in families or "Microsoft YaHei" in families
+metrics = QFontMetrics(QFont("Microsoft YaHei UI", 14))
+assert metrics.inFontUcs4(ord("飞"))
+assert metrics.inFontUcs4(ord("书"))
 '''
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"
