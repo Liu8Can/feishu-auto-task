@@ -320,6 +320,7 @@ def test_open_attendance_failure_explains_likely_account_and_navigation_causes(
     assert controller.window.connection_status == "error"
     assert "切换了飞书账号或企业" in controller.window.diagnostics_result.text
     assert "未将“假勤”固定到飞书左侧导航栏" in controller.window.diagnostics_result.text
+    assert "飞书尚未登录，或页面仍在加载" in controller.window.diagnostics_result.text
     assert warning["title"] == "打开假勤失败"
     assert warning["message"] == controller.window.diagnostics_result.text
     assert "切换飞书账号或企业" in logged[0][0]
