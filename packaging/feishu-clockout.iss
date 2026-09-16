@@ -1,5 +1,5 @@
-#define AppName "飞书动态下班打卡助手"
-#define AppVersion "1.0.0"
+#define AppName "飞书自动打卡助手"
+#define AppVersion "1.1.0"
 #define AppExeName "FeishuClockoutAssistant.exe"
 
 [Setup]

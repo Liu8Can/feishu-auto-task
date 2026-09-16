@@ -8,7 +8,7 @@ from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication
 
 from clockout.config import AppConfig, save_config
-from clockout.qt_app import APP_QSS, AppController, _apply_light_palette
+from clockout.qt_app import AppController
 from clockout.runtime import RuntimePaths
 
 
@@ -32,12 +32,11 @@ def main() -> None:
                 monitor_enabled=False,
                 start_with_windows=False,
                 trusted_container_fingerprint="",
+                theme_mode="light",
             ),
         )
         app = QApplication([])
         QFontDatabase.addApplicationFont(r"C:\Windows\Fonts\msyh.ttc")
-        _apply_light_palette(app)
-        app.setStyleSheet(APP_QSS)
         controller = AppController(app, paths, background=False)
         try:
             app.processEvents()

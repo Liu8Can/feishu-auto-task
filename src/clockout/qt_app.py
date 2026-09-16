@@ -108,7 +108,7 @@ def _parse_ipc_command(payload: bytes) -> str | None:
     return None
 
 
-APP_TITLE = "飞书动态打卡助手"
+APP_TITLE = "飞书自动打卡助手"
 STATUS_TEXT = {
     "idle": "准备就绪",
     "checking": "正在检查",
@@ -250,7 +250,7 @@ class MainWindow(QMainWindow):
         top.setContentsMargins(28, 14, 28, 14)
         identity = QVBoxLayout()
         identity.setSpacing(1)
-        brand = QLabel("飞书打卡助手", objectName="brand")
+        brand = QLabel(APP_TITLE, objectName="brand")
         subtitle = QLabel("飞书本机自动化", objectName="eyebrow")
         identity.addWidget(brand)
         identity.addWidget(subtitle)

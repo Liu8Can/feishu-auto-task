@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -14,12 +14,12 @@ VSVersionInfo(
       StringTable(
         u'080404b0',
         [StringStruct(u'CompanyName', u'Feishu Clockout Assistant'),
-         StringStruct(u'FileDescription', u'飞书动态下班打卡助手'),
-         StringStruct(u'FileVersion', u'1.0.0'),
+         StringStruct(u'FileDescription', u'飞书自动打卡助手'),
+         StringStruct(u'FileVersion', u'1.1.0'),
          StringStruct(u'InternalName', u'FeishuClockoutAssistant'),
          StringStruct(u'OriginalFilename', u'FeishuClockoutAssistant.exe'),
-         StringStruct(u'ProductName', u'飞书动态下班打卡助手'),
-         StringStruct(u'ProductVersion', u'1.0.0')])
+         StringStruct(u'ProductName', u'飞书自动打卡助手'),
+         StringStruct(u'ProductVersion', u'1.1.0')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
   ]
