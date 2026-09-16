@@ -3,11 +3,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from enum import Enum
 from typing import Iterable
 
 
 class CheckInTimeError(ValueError):
     """Raised when the check-in time cannot be determined safely."""
+
+
+class PunchAction(str, Enum):
+    CHECK_IN = "check_in"
+    CHECK_OUT = "check_out"
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +27,8 @@ class AttendanceSnapshot:
     signature: str
     container_id: str
     button_id: str
+    action: PunchAction = PunchAction.CHECK_OUT
+    action_completed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

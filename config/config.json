@@ -1,9 +1,14 @@
 {
+  "schema_version": 2,
   "work_duration_minutes": 480,
   "buffer_minutes": 5,
   "check_interval_minutes": 5,
-  "check_start_time": "15:00",
-  "check_end_time": "23:30",
+  "check_in_window_start": "07:00",
+  "check_in_window_end": "11:00",
+  "check_out_window_start": "15:00",
+  "check_out_window_end": "23:30",
+  "auto_check_in_enabled": false,
+  "auto_check_out_enabled": true,
   "mode": "automatic",
   "weekdays": [
     0,
@@ -18,5 +23,10 @@
   "break_start_time": "12:00",
   "break_end_time": "14:00",
   "fixed_checkin_time": "08:50",
-  "fixed_clockout_time": "18:50"
+  "fixed_clockout_time": "18:50",
+  "monitor_enabled": true,
+  "start_with_windows": true,
+  "max_click_attempts": 3,
+  "retry_delay_minutes": 5,
+  "theme_mode": "system"
 }

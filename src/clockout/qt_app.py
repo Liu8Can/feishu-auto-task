@@ -4,8 +4,9 @@ import ctypes
 import getpass
 import hashlib
 import logging
+import os
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -26,7 +27,6 @@ from PySide6.QtGui import (
     QCloseEvent,
     QIcon,
     QPainter,
-    QPalette,
     QPen,
     QPixmap,
     QShowEvent,
@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
@@ -56,7 +57,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import AppConfig, load_config, save_config
-from .core import AttendanceSnapshot, CheckResult, calculate_eligible_time
+from .core import AttendanceSnapshot, CheckResult, PunchAction, calculate_eligible_time
 from .engine import ClockoutEngine, EngineConfig
 from .feishu_uia import FeishuUiaAdapter
 from .runtime import (
@@ -68,9 +69,46 @@ from .runtime import (
     set_start_with_windows,
 )
 from .storage import JsonStateStore, StateStoreError
+from .scheduler import next_scheduled_run
+from .ui import (
+    SemanticStatus,
+    ThemeMode,
+    TimelineRow,
+    install_theme,
+    restore_keyboard_focus,
+)
 
 
-APP_TITLE = "飞书动态下班打卡助手"
+IPC_SHOW = b"show"
+IPC_WAKE = b"wake"
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchRequest:
+    background: bool
+    ipc_command: bytes
+
+
+def _parse_launch_request(arguments: list[str]) -> LaunchRequest:
+    scheduled_wake = "--scheduled-wake" in arguments
+    background = scheduled_wake or any(
+        argument in {"--background", "--startup"} for argument in arguments
+    )
+    return LaunchRequest(
+        background=background,
+        ipc_command=IPC_WAKE if scheduled_wake else IPC_SHOW,
+    )
+
+
+def _parse_ipc_command(payload: bytes) -> str | None:
+    if payload == IPC_SHOW:
+        return "show"
+    if payload == IPC_WAKE:
+        return "wake"
+    return None
+
+
+APP_TITLE = "飞书自动打卡助手"
 STATUS_TEXT = {
     "idle": "准备就绪",
     "checking": "正在检查",
@@ -81,22 +119,36 @@ STATUS_TEXT = {
     "skipped": "等待检查时段",
     "already_attempted": "等待人工核验",
     "already_clocked_out": "今日已经打卡",
+    "already_clocked_in": "今日已经打卡",
     "unknown": "结果需要确认",
     "retry_waiting": "等待自动重试",
     "retry_exhausted": "今日重试已停止",
 }
 
 
-def _apply_light_titlebar(window: QMainWindow) -> None:
+def _semantic_status(status: str) -> SemanticStatus:
+    if status in {"success", "already_clocked_in", "already_clocked_out"}:
+        return SemanticStatus.SUCCESS
+    if status in {"checking"}:
+        return SemanticStatus.RUNNING
+    if status in {"waiting", "idle", "dry_run_ready", "skipped"}:
+        return SemanticStatus.INFO
+    if status in {"unknown", "retry_waiting", "retry_exhausted", "already_attempted"}:
+        return SemanticStatus.WARNING
+    return SemanticStatus.ERROR
+
+
+def _apply_titlebar(window: QMainWindow, mode: ThemeMode) -> None:
     if sys.platform != "win32":
         return
     try:
         handle = int(window.winId())
-        dark_mode = ctypes.c_int(0)
-        white = ctypes.c_int(0x00FFFFFF)
-        dark_text = ctypes.c_int(0x001F1D1D)
-        border = ctypes.c_int(0x00D7D2D2)
-        for attribute, value in ((20, dark_mode), (35, white), (36, dark_text), (34, border)):
+        is_dark = mode is ThemeMode.DARK
+        dark_mode = ctypes.c_int(1 if is_dark else 0)
+        background = ctypes.c_int(0x00262520 if is_dark else 0x00FFFFFF)
+        text = ctypes.c_int(0x00F6F4F3 if is_dark else 0x001F1D1D)
+        border = ctypes.c_int(0x00423B38 if is_dark else 0x00D7D2D2)
+        for attribute, value in ((20, dark_mode), (35, background), (36, text), (34, border)):
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 handle,
                 attribute,
@@ -105,120 +157,6 @@ def _apply_light_titlebar(window: QMainWindow) -> None:
             )
     except (AttributeError, OSError):
         pass
-
-
-def _apply_light_palette(app: QApplication) -> None:
-    app.setStyle("Fusion")
-    palette = QPalette()
-    colors = {
-        QPalette.ColorRole.Window: "#f5f5f7",
-        QPalette.ColorRole.WindowText: "#1d1d1f",
-        QPalette.ColorRole.Base: "#ffffff",
-        QPalette.ColorRole.AlternateBase: "#f5f5f7",
-        QPalette.ColorRole.ToolTipBase: "#2c2c2e",
-        QPalette.ColorRole.ToolTipText: "#ffffff",
-        QPalette.ColorRole.Text: "#1d1d1f",
-        QPalette.ColorRole.Button: "#ffffff",
-        QPalette.ColorRole.ButtonText: "#1d1d1f",
-        QPalette.ColorRole.Highlight: "#0071e3",
-        QPalette.ColorRole.HighlightedText: "#ffffff",
-        QPalette.ColorRole.PlaceholderText: "#86868b",
-    }
-    for role, color in colors.items():
-        palette.setColor(role, QColor(color))
-    palette.setColor(
-        QPalette.ColorGroup.Disabled,
-        QPalette.ColorRole.ButtonText,
-        QColor("#86868b"),
-    )
-    palette.setColor(
-        QPalette.ColorGroup.Disabled,
-        QPalette.ColorRole.Text,
-        QColor("#86868b"),
-    )
-    app.setPalette(palette)
-
-
-APP_QSS = """
-QWidget {
-    color: #1d1d1f;
-    font-family: "Segoe UI Variable", "Microsoft YaHei UI", "Segoe UI";
-    font-size: 14px;
-}
-QMainWindow, QWidget#root { background: #f5f5f7; }
-QFrame#topbar { background: #ffffff; border-bottom: 1px solid #e6e6e9; }
-QFrame#tabs { background: #f5f5f7; border: 0; }
-QLabel#brand { font-size: 17px; font-weight: 700; color: #1d1d1f; }
-QLabel#eyebrow { color: #6e6e73; font-size: 12px; }
-QLabel#pageTitle { font-size: 24px; font-weight: 700; color: #1d1d1f; }
-QLabel#pageSubtitle { color: #6e6e73; font-size: 13px; }
-QPushButton#nav {
-    min-width: 82px; padding: 8px 16px; border: 0; border-radius: 8px;
-    color: #6e6e73; background: transparent; font-weight: 600;
-}
-QPushButton#nav:hover { background: #eaeaee; color: #1d1d1f; }
-QPushButton#nav:checked { background: #ffffff; color: #0071e3; font-weight: 700; }
-QPushButton#primary {
-    background: #0071e3; color: white; border: 0; border-radius: 8px;
-    padding: 9px 16px; font-weight: 700;
-}
-QPushButton#primary:hover { background: #0077ed; }
-QPushButton#primary:pressed { background: #0068d1; }
-QPushButton#primary:disabled { background: #b8cbe0; }
-QPushButton#secondary {
-    background: #ffffff; color: #1d1d1f; border: 1px solid #d2d2d7;
-    border-radius: 8px; padding: 8px 14px;
-}
-QPushButton#secondary:hover { background: #f7f7f8; border-color: #b8b8bd; }
-QPushButton#danger {
-    background: transparent; color: #d70015; border: 1px solid #edb8bd;
-    border-radius: 8px; padding: 8px 14px;
-}
-QPushButton#danger:hover { background: #fff2f3; }
-QFrame#statusPanel {
-    background: #ffffff; border: 1px solid #e1e1e5; border-radius: 8px;
-}
-QLabel#statusTitle { font-size: 23px; font-weight: 700; color: #1d1d1f; }
-QLabel#statusMessage { color: #6e6e73; }
-QLabel#metricValue { font-size: 22px; font-weight: 700; color: #1d1d1f; }
-QLabel#metricLabel { color: #86868b; font-size: 12px; font-weight: 600; }
-QFrame#metricCell { border-right: 1px solid #e7e7eb; }
-QFrame#sectionLine { background: #e5e5e9; min-height: 1px; max-height: 1px; }
-QLabel#sectionTitle { font-size: 15px; font-weight: 700; color: #1d1d1f; }
-QLabel#small { color: #86868b; font-size: 12px; }
-QLabel#warning {
-    color: #5c4b18; background: #fff9e8; border: 1px solid #eee2bd;
-    border-radius: 8px; padding: 10px 12px;
-}
-QComboBox, QSpinBox, QTimeEdit, QTextEdit {
-    background: #ffffff; border: 1px solid #d2d2d7; border-radius: 8px;
-    padding: 8px 10px; selection-background-color: #cce5ff;
-}
-QComboBox:focus, QSpinBox:focus, QTimeEdit:focus, QTextEdit:focus {
-    border-color: #0071e3;
-}
-QTextEdit { padding: 11px; font-family: "Microsoft YaHei UI", "Segoe UI Variable"; font-size: 13px; }
-QCheckBox { spacing: 9px; }
-QMenu { background: #ffffff; border: 1px solid #d2d2d7; padding: 6px; }
-QMenu::item { padding: 7px 24px 7px 10px; border-radius: 6px; }
-QMenu::item:selected { background: #eaf4ff; color: #0071e3; }
-QToolTip { background: #2c2c2e; color: white; border: 0; padding: 5px 7px; }
-QMessageBox, QDialog { background: #f5f5f7; color: #1d1d1f; }
-QMessageBox QLabel, QDialog QLabel { color: #1d1d1f; background: transparent; }
-QMessageBox QPushButton, QDialogButtonBox QPushButton {
-    min-width: 76px; background: #ffffff; color: #1d1d1f;
-    border: 1px solid #d2d2d7; border-radius: 8px; padding: 7px 14px;
-    outline: none;
-}
-QMessageBox QPushButton:hover, QDialogButtonBox QPushButton:hover {
-    background: #f0f0f2; border-color: #b8b8bd;
-}
-QLineEdit {
-    background: #ffffff; color: #1d1d1f; border: 1px solid #d2d2d7;
-    border-radius: 8px; padding: 8px 10px; selection-background-color: #cce5ff;
-}
-QPushButton:focus { outline: none; }
-"""
 
 
 class ToggleSwitch(QAbstractButton):
@@ -312,7 +250,7 @@ class MainWindow(QMainWindow):
         top.setContentsMargins(28, 14, 28, 14)
         identity = QVBoxLayout()
         identity.setSpacing(1)
-        brand = QLabel("下班打卡助手", objectName="brand")
+        brand = QLabel(APP_TITLE, objectName="brand")
         subtitle = QLabel("飞书本机自动化", objectName="eyebrow")
         identity.addWidget(brand)
         identity.addWidget(subtitle)
@@ -344,8 +282,7 @@ class MainWindow(QMainWindow):
         tab_layout.addStretch(1)
         shell.addWidget(tabs)
         shell.addWidget(self.stack, 1)
-        for button in self.findChildren(QPushButton):
-            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        restore_keyboard_focus(self)
         self._show_page(0)
 
     def _page_shell(self, title: str, subtitle: str) -> tuple[QWidget, QVBoxLayout]:
@@ -405,7 +342,14 @@ class MainWindow(QMainWindow):
         more_menu.addAction("打开飞书假勤", self.controller.open_attendance)
         more_menu.addAction("重新绑定页面", self.controller.calibrate)
         more_menu.addSeparator()
-        self.reset_action = more_menu.addAction("重置今日失败状态", self.controller.request_reset)
+        self.reset_check_in_action = more_menu.addAction(
+            "重置上班失败状态",
+            lambda: self.controller.request_reset(PunchAction.CHECK_IN),
+        )
+        self.reset_check_out_action = more_menu.addAction(
+            "重置下班失败状态",
+            lambda: self.controller.request_reset(PunchAction.CHECK_OUT),
+        )
         more.setMenu(more_menu)
         actions.addWidget(check)
         actions.addWidget(settings)
@@ -413,6 +357,17 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         layout.addLayout(actions)
         layout.addSpacing(22)
+
+        action_panel = QFrame(objectName="statusPanel")
+        action_layout = QVBoxLayout(action_panel)
+        action_layout.setContentsMargins(18, 8, 18, 8)
+        action_layout.setSpacing(0)
+        self.check_in_row = TimelineRow("--:--", "上班自动打卡", "尚未读取状态")
+        self.check_out_row = TimelineRow("--:--", "下班自动打卡", "尚未读取状态")
+        action_layout.addWidget(self.check_in_row)
+        action_layout.addWidget(self.check_out_row)
+        layout.addWidget(action_panel)
+        layout.addSpacing(18)
 
         section = QHBoxLayout()
         section.addWidget(QLabel("今日计算", objectName="sectionTitle"))
@@ -439,7 +394,15 @@ class MainWindow(QMainWindow):
         self.retry_note.setWordWrap(True)
         layout.addWidget(self.retry_note)
         layout.addStretch(1)
-        return page
+        return self._scroll_page(page)
+
+    @staticmethod
+    def _scroll_page(page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
 
     def _add_metric(self, layout: QHBoxLayout, label: str, value: str, *, last: bool = False) -> QLabel:
         frame = QFrame(objectName="" if last else "metricCell")
@@ -468,7 +431,19 @@ class MainWindow(QMainWindow):
         self.fixed_clockout = QTimeEdit(); self.fixed_clockout.setDisplayFormat("HH:mm")
         self.max_attempts = QSpinBox(); self.max_attempts.setRange(1, 5); self.max_attempts.setSuffix(" 次")
         self.retry_delay = QSpinBox(); self.retry_delay.setRange(1, 60); self.retry_delay.setSuffix(" 分钟")
+        self.check_in_start = QTimeEdit(); self.check_in_start.setDisplayFormat("HH:mm")
+        self.check_in_end = QTimeEdit(); self.check_in_end.setDisplayFormat("HH:mm")
+        self.check_out_start = QTimeEdit(); self.check_out_start.setDisplayFormat("HH:mm")
+        self.check_out_end = QTimeEdit(); self.check_out_end.setDisplayFormat("HH:mm")
+        self.theme_mode = QComboBox()
+        self.theme_mode.addItem("跟随系统", "system")
+        self.theme_mode.addItem("浅色", "light")
+        self.theme_mode.addItem("深色", "dark")
         widgets = (
+            ("上班检查开始", self.check_in_start),
+            ("上班检查结束", self.check_in_end),
+            ("下班检查开始", self.check_out_start),
+            ("下班检查结束", self.check_out_end),
             ("下班时间算法", self.calc_mode),
             ("有效工作时长", self.work_minutes),
             ("安全缓冲", self.buffer_minutes),
@@ -478,6 +453,7 @@ class MainWindow(QMainWindow):
             ("固定下班时间", self.fixed_clockout),
             ("最多自动尝试", self.max_attempts),
             ("失败重试间隔", self.retry_delay),
+            ("界面主题", self.theme_mode),
         )
         for index, (label, widget) in enumerate(widgets):
             row, column = divmod(index, 2)
@@ -487,8 +463,14 @@ class MainWindow(QMainWindow):
             form.addLayout(cell, row, column)
         layout.addLayout(form)
         layout.addSpacing(20)
+        self.auto_check_in = QCheckBox("启用上班自动打卡")
+        self.auto_check_out = QCheckBox("启用下班自动打卡")
         self.auto_open_check = QCheckBox("检查时自动启动飞书并打开假勤")
         self.startup_check = QCheckBox("登录 Windows 后自动在后台运行")
+        layout.addWidget(self.auto_check_in)
+        layout.addSpacing(8)
+        layout.addWidget(self.auto_check_out)
+        layout.addSpacing(8)
         layout.addWidget(self.auto_open_check)
         layout.addSpacing(8)
         layout.addWidget(self.startup_check)
@@ -499,11 +481,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(save)
         layout.addStretch(1)
         self.load_settings()
-        return page
+        return self._scroll_page(page)
 
     def _diagnostics_page(self) -> QWidget:
         page, layout = self._page_shell("连接诊断", "检查飞书窗口、假勤页面和页面绑定是否可用。")
         self.diagnostics_result = QTextEdit()
+        self.diagnostics_result.setObjectName("diagnostics")
         self.diagnostics_result.setReadOnly(True)
         self.diagnostics_result.setPlainText("尚未运行诊断")
         self.diagnostics_result.setMaximumHeight(220)
@@ -529,17 +512,11 @@ class MainWindow(QMainWindow):
         return page
 
     def show_connection_result(self, message: str, status: str = "neutral") -> None:
-        colors = {
-            "neutral": ("#ffffff", "#1d1d1f", "#d2d2d7"),
-            "running": ("#eef6ff", "#075da8", "#b9d9f7"),
-            "success": ("#eef9f2", "#176b3a", "#b8dfc7"),
-            "error": ("#fff1f2", "#a3182a", "#efbdc4"),
-        }
-        background, foreground, border = colors.get(status, colors["neutral"])
-        self.diagnostics_result.setStyleSheet(
-            f"background: {background}; color: {foreground}; "
-            f"border: 1px solid {border}; border-radius: 8px; padding: 11px;"
-        )
+        self.diagnostics_result.setProperty("status", status)
+        style = self.diagnostics_result.style()
+        if style is not None:
+            style.unpolish(self.diagnostics_result)
+            style.polish(self.diagnostics_result)
         self.diagnostics_result.setPlainText(message)
 
     def set_connection_busy(self, busy: bool, task_name: str = "") -> None:
@@ -578,6 +555,13 @@ class MainWindow(QMainWindow):
         self.fixed_clockout.setTime(QTime.fromString(config.fixed_clockout_time, "HH:mm"))
         self.max_attempts.setValue(config.max_click_attempts)
         self.retry_delay.setValue(config.retry_delay_minutes)
+        self.check_in_start.setTime(QTime.fromString(config.check_in_window_start, "HH:mm"))
+        self.check_in_end.setTime(QTime.fromString(config.check_in_window_end, "HH:mm"))
+        self.check_out_start.setTime(QTime.fromString(config.check_out_window_start, "HH:mm"))
+        self.check_out_end.setTime(QTime.fromString(config.check_out_window_end, "HH:mm"))
+        self.theme_mode.setCurrentIndex(max(0, self.theme_mode.findData(config.theme_mode)))
+        self.auto_check_in.setChecked(config.auto_check_in_enabled)
+        self.auto_check_out.setChecked(config.auto_check_out_enabled)
         self.auto_open_check.setChecked(config.auto_open_workbench)
         self.startup_check.setChecked(config.start_with_windows)
 
@@ -592,11 +576,20 @@ class MainWindow(QMainWindow):
             fixed_clockout_time=self.fixed_clockout.time().toString("HH:mm"),
             max_click_attempts=self.max_attempts.value(),
             retry_delay_minutes=self.retry_delay.value(),
+            check_in_window_start=self.check_in_start.time().toString("HH:mm"),
+            check_in_window_end=self.check_in_end.time().toString("HH:mm"),
+            check_out_window_start=self.check_out_start.time().toString("HH:mm"),
+            check_out_window_end=self.check_out_end.time().toString("HH:mm"),
+            theme_mode=str(self.theme_mode.currentData()),
+            auto_check_in_enabled=self.auto_check_in.isChecked(),
+            auto_check_out_enabled=self.auto_check_out.isChecked(),
             auto_open_workbench=self.auto_open_check.isChecked(),
             start_with_windows=self.startup_check.isChecked(),
         )
 
-    def update_status(self, result: CheckResult) -> None:
+    def update_status(
+        self, result: CheckResult, action: PunchAction | None = None
+    ) -> None:
         self.status_title.setText(STATUS_TEXT.get(result.status, result.status))
         self.status_message.setText(result.message)
         if result.check_in_time:
@@ -605,7 +598,27 @@ class MainWindow(QMainWindow):
             self.calc_values[0].setText(text)
         if result.eligible_time:
             self.eligible_value.setText(result.eligible_time.strftime("%H:%M"))
-        self.reset_action.setEnabled(result.status not in {"success", "already_clocked_out"})
+        if action is not None:
+            self.update_action_status(action, result.status, result.message)
+
+    def update_action_status(
+        self, action: PunchAction, status: str, detail: str
+    ) -> None:
+        config = self.controller.config
+        if action is PunchAction.CHECK_IN:
+            row = self.check_in_row
+            window = f"{config.check_in_window_start}-{config.check_in_window_end}"
+            enabled = config.auto_check_in_enabled
+            reset_action = self.reset_check_in_action
+        else:
+            row = self.check_out_row
+            window = f"{config.check_out_window_start}-{config.check_out_window_end}"
+            enabled = config.auto_check_out_enabled
+            reset_action = self.reset_check_out_action
+        semantic = _semantic_status(status) if enabled else SemanticStatus.NEUTRAL
+        state_text = STATUS_TEXT.get(status, status) if enabled else "未启用"
+        row.set_entry(window, row.title_label.text(), f"{state_text} · {detail}", status=semantic)
+        reset_action.setEnabled(enabled and status not in {"success", "already_clocked_in", "already_clocked_out"})
 
     def update_monitor(self, enabled: bool) -> None:
         self.monitor_switch.blockSignals(True)
@@ -624,7 +637,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def showEvent(self, event: QShowEvent) -> None:
-        _apply_light_titlebar(self)
+        _apply_titlebar(self, self.controller.theme_manager.resolved_mode)
         super().showEvent(event)
 
     def changeEvent(self, event: QEvent) -> None:
@@ -654,6 +667,7 @@ class AppController(QObject):
         prepare_runtime_paths(paths)
         self.config = load_config(paths.config_path)
         save_config(paths.config_path, self.config)
+        self.theme_manager = install_theme(app, self.config.theme_mode)
         self.store = JsonStateStore(paths.state_path)
         self.adapter = FeishuUiaAdapter(
             auto_open_workbench=self.config.auto_open_workbench,
@@ -665,10 +679,28 @@ class AppController(QObject):
         self._active_worker: Worker | None = None
         self._active_task_name = ""
         self._active_task_timed_out = False
+        self._worker_generation = 0
+        self._worker_timeout_ms = 30000
+        self._pending_worker: tuple[
+            Callable[[], object],
+            Callable[[object], None],
+            Callable[[str], None],
+            str,
+        ] | None = None
+        self._shutting_down = False
+        self._quit_grace_ms = 1000
+        self._hard_exit: Callable[[int], object] = os._exit
         self.next_check: datetime | None = None
+        self.next_action: PunchAction | None = None
+        self._running_action: PunchAction | None = None
         self.last_tick = datetime.now()
         self.logger = self._setup_logger(paths.log_dir)
         self.window = MainWindow(self)
+        self.theme_manager.themeChanged.connect(
+            lambda _mode: _apply_titlebar(
+                self.window, self.theme_manager.resolved_mode
+            )
+        )
         self.tray = QSystemTrayIcon(_tray_icon(), self.window)
         self._build_tray()
         self.tray.show()
@@ -703,6 +735,17 @@ class AppController(QObject):
         if reason in {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick}:
             self.window.show_from_tray()
 
+    def handle_instance_command(self, command: str) -> bool:
+        if command == "show":
+            self.window.show_from_tray()
+            self.log("已从第二次启动请求唤回主界面")
+            return True
+        if command == "wake":
+            self._schedule_from(datetime.now())
+            self.log("已收到计划唤醒请求，静默重新安排检查")
+            return True
+        return False
+
     def _engine(self) -> ClockoutEngine:
         config = EngineConfig(
             mode=self.config.mode,
@@ -710,6 +753,10 @@ class AppController(QObject):
             safety_buffer_minutes=self.config.buffer_minutes,
             check_start_time=self.config.start_time,
             check_end_time=self.config.end_time,
+            check_in_start_time=self.config.check_in_start,
+            check_in_end_time=self.config.check_in_end,
+            auto_check_in_enabled=self.config.auto_check_in_enabled,
+            auto_check_out_enabled=self.config.auto_check_out_enabled,
             weekdays=frozenset(self.config.weekdays),
             calculation_mode=self.config.calculation_mode,
             break_start_time=self.config.break_start,
@@ -784,26 +831,81 @@ class AppController(QObject):
             self.log("后台监控已开启")
         else:
             self.next_check = None
+            self.next_action = None
             self.window.next_value.setText("已暂停")
             self.log("后台监控已暂停")
 
-    def _schedule_from(self, now: datetime, *, immediate: bool = False) -> None:
+    def _schedule_from(
+        self,
+        now: datetime,
+        *,
+        immediate: bool = False,
+        completed_actions: set[PunchAction] | None = None,
+        eligible_at_by_action: dict[PunchAction, datetime | None] | None = None,
+    ) -> None:
         if not self.config.monitor_enabled:
             self.next_check = None
+            self.next_action = None
             return
-        if self.config.start_time <= now.time() <= self.config.end_time:
-            self.next_check = now if immediate else now + timedelta(seconds=2)
-        elif now.time() < self.config.start_time:
-            self.next_check = datetime.combine(now.date(), self.config.start_time)
-        else:
-            self.next_check = self._next_workday_start(now.date())
+        completed = set(completed_actions or ())
+        retry_at: dict[PunchAction, datetime | None] = {}
+        try:
+            state = self.store.load(now.date())
+        except Exception:
+            state = None
+        if state is not None:
+            for action in PunchAction:
+                action_state = state.action(action)
+                if action_state is None:
+                    continue
+                if action_state.success:
+                    completed.add(action)
+                elif (
+                    action_state.outcome == "aborted_before_click"
+                    and action_state.attempt_count >= self.config.max_click_attempts
+                ):
+                    completed.add(action)
+                if action_state.next_retry_at:
+                    retry_at[action] = datetime.fromisoformat(action_state.next_retry_at)
+                elif action_state.outcome in {"unknown", "click_failed"}:
+                    verification_at = now + timedelta(
+                        minutes=self.config.check_interval_minutes
+                    )
+                    window_end = (
+                        self.config.check_in_end
+                        if action is PunchAction.CHECK_IN
+                        else self.config.check_out_end
+                    )
+                    if (
+                        verification_at.date() == now.date()
+                        and verification_at.time() <= window_end
+                    ):
+                        retry_at[action] = verification_at
+                    else:
+                        completed.add(action)
+        scheduled = next_scheduled_run(
+            now,
+            self.config,
+            completed_actions=completed,
+            retry_at_by_action=retry_at,
+            eligible_at_by_action=eligible_at_by_action,
+        )
+        self.next_action = scheduled.action if scheduled else None
+        self.next_check = scheduled.run_at if scheduled else None
+        if immediate and self.next_check is not None and self.next_check.date() == now.date():
+            self.next_check = max(now, self.next_check)
         self._update_next_label()
 
     def _next_workday_start(self, day: date) -> datetime:
         cursor = day + timedelta(days=1)
         while cursor.weekday() not in self.config.weekdays:
             cursor += timedelta(days=1)
-        return datetime.combine(cursor, self.config.start_time)
+        enabled_starts = []
+        if self.config.auto_check_in_enabled:
+            enabled_starts.append(self.config.check_in_start)
+        if self.config.auto_check_out_enabled:
+            enabled_starts.append(self.config.check_out_start)
+        return datetime.combine(cursor, min(enabled_starts, default=self.config.start_time))
 
     def _tick(self) -> None:
         now = datetime.now()
@@ -814,7 +916,13 @@ class AppController(QObject):
             self._schedule_from(now, immediate=True)
             self.log("系统从睡眠或长时间停顿中恢复，已重新安排检查")
         self.last_tick = now
-        if self.config.monitor_enabled and not self.busy and self.next_check and now >= self.next_check:
+        if (
+            self.config.monitor_enabled
+            and not self.busy
+            and self._active_worker is None
+            and self.next_check
+            and now >= self.next_check
+        ):
             self.run_check_now()
         self._update_next_label()
 
@@ -823,15 +931,22 @@ class AppController(QObject):
             self._show_busy_feedback()
             return
         now = datetime.now()
-        if not (self.config.start_time <= now.time() <= self.config.end_time):
-            self._schedule_from(now)
-            self._show_result(CheckResult("skipped", "当前不在检查时段，已安排下一次检查"))
+        if (
+            self.next_action is None
+            or self.next_check is None
+        ):
+            self._schedule_from(now, immediate=True)
+        action = self.next_action
+        if action is None or self.next_check is None or self.next_check > now:
+            self._show_result(CheckResult("skipped", "当前没有到期动作，已安排下一次检查"))
             return
+        self._running_action = action
         self.busy = True
-        self._show_result(CheckResult("checking", "正在读取飞书假勤页面"))
-        self.log("开始检查")
+        label = "上班" if action is PunchAction.CHECK_IN else "下班"
+        self._show_result(CheckResult("checking", f"正在检查{label}打卡条件"), action)
+        self.log("开始检查%s打卡", label)
         self._start_worker(
-            lambda: self._engine().check(datetime.now()),
+            lambda: self._engine().check(action, datetime.now()),
             self._check_finished,
             self._task_failed,
             "检查飞书假勤页面",
@@ -839,26 +954,47 @@ class AppController(QObject):
 
     def _check_finished(self, value: object) -> None:
         self.busy = False
+        action = self._running_action
+        self._running_action = None
         result = value if isinstance(value, CheckResult) else CheckResult("blocked", "检查返回了无效结果")
-        self._show_result(result)
+        self._show_result(result, action)
         now = datetime.now()
-        if result.status == "waiting" and result.eligible_time:
-            self.next_check = result.eligible_time
-        elif result.status == "retry_waiting" and result.next_retry_time:
-            self.next_check = result.next_retry_time
-        elif result.status in {"success", "already_clocked_out", "retry_exhausted"}:
-            self.next_check = self._next_workday_start(now.date())
-        elif result.status == "unknown":
-            self.next_check = now + timedelta(minutes=self.config.check_interval_minutes)
-        elif self.config.monitor_enabled:
-            self.next_check = now + timedelta(minutes=self.config.check_interval_minutes)
+        terminal_actions: set[PunchAction] = set()
+        deferred: dict[PunchAction, datetime | None] = {}
+        if action is not None:
+            if result.status in {
+                "success",
+                "already_clocked_in",
+                "already_clocked_out",
+                "retry_exhausted",
+            }:
+                terminal_actions.add(action)
+            elif result.status == "waiting" and result.eligible_time:
+                deferred[action] = result.eligible_time
+            elif result.status == "retry_waiting" and result.next_retry_time:
+                deferred[action] = result.next_retry_time
+            else:
+                deferred[action] = now + timedelta(
+                    minutes=self.config.check_interval_minutes
+                )
+            candidate = deferred.get(action)
+            if candidate is not None and candidate.date() != now.date():
+                deferred.pop(action)
+                terminal_actions.add(action)
+        self._schedule_from(
+            now,
+            completed_actions=terminal_actions,
+            eligible_at_by_action=deferred,
+        )
         self._update_next_label()
         if result.status in {"success", "unknown", "retry_exhausted"}:
             icon = QSystemTrayIcon.MessageIcon.Information if result.status == "success" else QSystemTrayIcon.MessageIcon.Warning
             self.tray.showMessage(APP_TITLE, result.message, icon, 5000)
 
-    def _show_result(self, result: CheckResult) -> None:
-        self.window.update_status(result)
+    def _show_result(
+        self, result: CheckResult, action: PunchAction | None = None
+    ) -> None:
+        self.window.update_status(result, action)
         self.tray_status.setText(f"状态：{STATUS_TEXT.get(result.status, result.status)}")
         color = "#1c7649" if result.status in {"success", "waiting", "already_clocked_out"} else "#bd7418" if result.status in {"retry_waiting", "unknown", "retry_exhausted"} else "#667069"
         self.tray.setIcon(_tray_icon(color))
@@ -870,7 +1006,8 @@ class AppController(QObject):
         elif self.next_check is None:
             self.window.next_value.setText("--:--")
         elif self.next_check.date() == date.today():
-            self.window.next_value.setText(self.next_check.strftime("%H:%M"))
+            action = "上班" if self.next_action is PunchAction.CHECK_IN else "下班"
+            self.window.next_value.setText(f"{action} {self.next_check:%H:%M}")
         else:
             self.window.next_value.setText(self.next_check.strftime("%m-%d %H:%M"))
 
@@ -882,14 +1019,30 @@ class AppController(QObject):
             return
         if state is None:
             self._show_result(CheckResult("idle", "后台监控已准备，等待进入检查时段"))
+            for action in PunchAction:
+                self.window.update_action_status(action, "idle", "等待进入检查时段")
             return
-        if state.clock_out_success:
-            self._show_result(CheckResult("success", "今日下班打卡已经确认成功"))
-        elif state.outcome == "aborted_before_click":
-            retry_at = datetime.fromisoformat(state.next_retry_at) if state.next_retry_at else None
-            self._show_result(CheckResult("retry_waiting", "点击前失败，等待有限重试", next_retry_time=retry_at))
-        elif state.clock_out_attempted:
-            self._show_result(CheckResult("unknown", "此前点击结果不明确，只会继续核验页面"))
+        for action in PunchAction:
+            action_state = state.action(action)
+            if action_state is None:
+                self.window.update_action_status(action, "idle", "等待进入检查时段")
+                continue
+            if action_state.success:
+                status, message = "success", "今日打卡已经确认成功"
+            elif action_state.outcome == "aborted_before_click":
+                status, message = "retry_waiting", "点击前失败，等待有限重试"
+            elif action_state.attempted:
+                status, message = "unknown", "此前点击结果不明确，只会继续核验页面"
+            else:
+                status, message = "idle", "失败状态已重置，等待重新检查"
+            self.window.update_action_status(action, status, message)
+        checkout = state.action(PunchAction.CHECK_OUT)
+        checkin = state.action(PunchAction.CHECK_IN)
+        latest_action = PunchAction.CHECK_OUT if checkout is not None else PunchAction.CHECK_IN
+        latest = checkout or checkin
+        if latest is not None:
+            status = "success" if latest.success else "unknown" if latest.attempted else "idle"
+            self._show_result(CheckResult(status, "已恢复今日打卡状态"), latest_action)
 
     def diagnose(self) -> None:
         if self.busy:
@@ -1006,7 +1159,9 @@ class AppController(QObject):
             f"{reason}\n\n请确认飞书已登录，并停留在今天的假勤页面后重试。",
         )
 
-    def request_reset(self) -> None:
+    def request_reset(self, action: PunchAction = PunchAction.CHECK_OUT) -> None:
+        action = PunchAction(action)
+        label = "上班" if action is PunchAction.CHECK_IN else "下班"
         if self.busy:
             return
         try:
@@ -1014,45 +1169,65 @@ class AppController(QObject):
         except Exception:
             QMessageBox.warning(self.window, "无法重置", "今日状态文件无法读取。")
             return
-        if state is None:
-            QMessageBox.information(self.window, "无需重置", "今天还没有失败记录。")
+        action_state = state.action(action) if state is not None else None
+        if action_state is None:
+            QMessageBox.information(self.window, "无需重置", f"今天还没有{label}失败记录。")
             return
-        if state.clock_out_success:
-            QMessageBox.warning(self.window, "不能重置", "飞书已确认今天打卡成功，不能再次开放点击。")
+        if action_state.success:
+            QMessageBox.warning(self.window, "不能重置", f"飞书已确认今天{label}打卡成功，不能再次开放点击。")
             return
-        self._run_task(lambda: self.adapter.snapshot(date.today()), self._reset_snapshot_ready, "正在核对飞书今日状态")
+        self._run_task(
+            lambda: self.adapter.snapshot_for_action(date.today(), action),
+            lambda value: self._reset_snapshot_ready(action, value),
+            f"正在核对飞书今日{label}状态",
+        )
 
-    def _reset_snapshot_ready(self, value: object) -> None:
+    def _reset_snapshot_ready(self, action: PunchAction, value: object) -> None:
+        label = "上班" if action is PunchAction.CHECK_IN else "下班"
         snapshot = value if isinstance(value, AttendanceSnapshot) else None
-        if snapshot is None or snapshot.page_date != date.today():
+        if (
+            snapshot is None
+            or snapshot.page_date != date.today()
+            or snapshot.action is not action
+        ):
             QMessageBox.warning(self.window, "无法重置", "未能确认飞书当前显示的是今天的假勤页面。")
             return
-        if snapshot.already_clocked_out:
-            QMessageBox.warning(self.window, "不能重置", "飞书页面已经存在今天的下班打卡记录。")
+        if snapshot.action_completed:
+            QMessageBox.warning(self.window, "不能重置", f"飞书页面已经存在今天的{label}打卡记录。")
             return
         if snapshot.blocking_reason or snapshot.button_count != 1 or not snapshot.button_enabled:
-            QMessageBox.warning(self.window, "无法重置", "尚未确认唯一可用的下班打卡按钮。")
+            QMessageBox.warning(self.window, "无法重置", f"尚未确认唯一可用的{label}打卡按钮。")
             return
         answer = QMessageBox.warning(
             self.window,
-            "重置今日失败状态",
-            "请先确认飞书今天确实没有下班打卡记录。重置后程序可能再次真实点击。",
+            f"重置{label}失败状态",
+            f"请先确认飞书今天确实没有{label}打卡记录。重置后程序可能再次真实点击。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        reason, accepted = QInputDialog.getText(self.window, "记录重置原因", "原因：", text="已人工核对飞书今日没有下班打卡记录")
+        reason, accepted = QInputDialog.getText(
+            self.window,
+            "记录重置原因",
+            "原因：",
+            text=f"已人工核对飞书今日没有{label}打卡记录",
+        )
         if not accepted:
             return
         try:
-            self.store.reset_for_retry(date.today(), reset_at=datetime.now(), reason=reason)
+            self.store.reset_action_for_retry(
+                date.today(), action, reset_at=datetime.now(), reason=reason
+            )
         except (StateStoreError, ValueError) as exc:
             QMessageBox.warning(self.window, "重置失败", str(exc))
             return
-        self.log("用户已安全重置今日失败状态：%s", reason)
+        self.log("用户已安全重置今日%s失败状态：%s", label, reason)
         self._schedule_from(datetime.now(), immediate=True)
-        self._show_result(CheckResult("idle", "今日失败状态已重置，等待重新检查"))
+        self._show_result(
+            CheckResult("idle", f"今日{label}失败状态已重置，等待重新检查"),
+            action,
+        )
 
     def save_settings(self, **changes: object) -> None:
         try:
@@ -1065,6 +1240,8 @@ class AppController(QObject):
             self.window.load_settings()
             return
         self.adapter.auto_open_workbench = updated.auto_open_workbench
+        self.theme_manager.set_mode(updated.theme_mode)
+        _apply_titlebar(self.window, self.theme_manager.resolved_mode)
         self._schedule_from(datetime.now(), immediate=True)
         self.window.retry_note.setText(
             f"自动重试最多 {updated.max_click_attempts} 次，仅限点击前失败；点击后结果不明确不会自动重复点击。"
@@ -1108,58 +1285,146 @@ class AppController(QObject):
         error_callback: Callable[[str], None],
         task_name: str,
     ) -> None:
+        if self._shutting_down:
+            self.busy = False
+            return
+        if self._active_worker is not None:
+            if self._pending_worker is None:
+                self._pending_worker = (
+                    function,
+                    callback,
+                    error_callback,
+                    task_name,
+                )
+                self.busy = True
+                message = (
+                    f"{self._active_task_name or '上一次调用'}仍在收尾，"
+                    f"{task_name}已排队"
+                )
+                self.window.status_message.setText(message)
+                self.window.set_connection_busy(True, task_name)
+                self.log(message)
+            else:
+                self._show_busy_feedback()
+            return
+        self._launch_worker(function, callback, error_callback, task_name)
+
+    def _launch_worker(
+        self,
+        function: Callable[[], object],
+        callback: Callable[[object], None],
+        error_callback: Callable[[str], None],
+        task_name: str,
+    ) -> None:
         worker = Worker(function, task_name)
+        self._worker_generation += 1
+        token = self._worker_generation
+        self.busy = True
         self._active_worker = worker
         self._active_task_name = task_name
         self._active_task_timed_out = False
         self.window.set_connection_busy(True, task_name)
         worker.signals.finished.connect(
-            lambda value, active=worker: self._worker_finished(
-                active, callback, value
+            lambda value, active=worker, generation=token: self._worker_finished(
+                active, callback, value, generation
             )
         )
         worker.signals.failed.connect(
-            lambda error, active=worker: self._worker_failed(
-                active, error_callback, error
+            lambda error, active=worker, generation=token: self._worker_failed(
+                active, error_callback, error, generation
             )
         )
         self.thread_pool.start(worker)
-        QTimer.singleShot(30000, lambda active=worker: self._worker_timed_out(active))
+        QTimer.singleShot(
+            self._worker_timeout_ms,
+            lambda active=worker, generation=token: self._worker_timed_out(
+                active, generation
+            ),
+        )
 
     def _worker_finished(
         self,
         worker: Worker,
         callback: Callable[[object], None],
         value: object,
+        token: int | None = None,
     ) -> None:
         if worker is not self._active_worker:
             return
-        self._release_worker()
-        callback(value)
+        if getattr(self, "_shutting_down", False):
+            self._complete_active_worker(worker)
+            return
+        should_deliver = (
+            not self._active_task_timed_out
+            and (token is None or token == getattr(self, "_worker_generation", token))
+        )
+        self._complete_active_worker(worker)
+        if should_deliver:
+            callback(value)
 
     def _worker_failed(
         self,
         worker: Worker,
         callback: Callable[[str], None],
         message: str,
+        token: int | None = None,
     ) -> None:
         if worker is not self._active_worker:
             return
-        self._release_worker()
-        callback(message)
+        if getattr(self, "_shutting_down", False):
+            self._complete_active_worker(worker)
+            return
+        should_deliver = (
+            not self._active_task_timed_out
+            and (token is None or token == getattr(self, "_worker_generation", token))
+        )
+        self._complete_active_worker(worker)
+        if should_deliver:
+            callback(message)
 
     def _release_worker(self) -> None:
+        worker = self._active_worker
+        if worker is None:
+            return
+        self._complete_active_worker(worker)
+
+    def _complete_active_worker(self, worker: Worker) -> None:
+        if worker is not self._active_worker:
+            return
+        timed_out = self._active_task_timed_out
+        completed_name = self._active_task_name
+        pending = getattr(self, "_pending_worker", None)
+        self._pending_worker = None
         self.busy = False
         self._active_worker = None
         self._active_task_name = ""
         self._active_task_timed_out = False
-        self.window.set_connection_busy(False)
+        if getattr(self, "_shutting_down", False):
+            return
+        if timed_out:
+            self.log("后台任务已结束收尾：%s", completed_name)
+        if pending is not None:
+            self._launch_worker(*pending)
+        else:
+            self.window.set_connection_busy(False)
 
-    def _worker_timed_out(self, worker: Worker) -> None:
-        if worker is not self._active_worker or self._active_task_timed_out:
+    def _worker_timed_out(self, worker: Worker, token: int | None = None) -> None:
+        if (
+            self._shutting_down
+            or worker is not self._active_worker
+            or self._active_task_timed_out
+            or (token is not None and token != self._worker_generation)
+        ):
             return
         self._active_task_timed_out = True
-        message = f"{self._active_task_name}超过 30 秒仍未完成，请重启程序后重试"
+        self._worker_generation += 1
+        self.busy = False
+        self.window.set_connection_busy(False)
+        seconds = max(1, self._worker_timeout_ms // 1000)
+        message = (
+            f"{self._active_task_name}超过 {seconds} 秒仍未完成；"
+            "界面已恢复，上一次调用仍在收尾"
+        )
         self.window.status_message.setText(message)
         self.window.show_connection_result(message, "error")
         self.log("后台任务超时：%s", self._active_task_name)
@@ -1198,10 +1463,42 @@ class AppController(QObject):
         self.window.append_log(rendered)
 
     def quit(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._worker_generation += 1
+        self._pending_worker = None
+        self.busy = False
+        self.timer.stop()
         self.window._really_close = True
         self.tray.hide()
         self.window.close()
+        if (
+            self._active_worker is not None
+            and not self.thread_pool.waitForDone(self._quit_grace_ms)
+        ):
+            try:
+                self.logger.warning(
+                    "后台任务未在退出宽限期内结束，程序将立即退出"
+                )
+            finally:
+                self._close_log_handlers()
+                self._hard_exit(0)
+            return
         self.app.quit()
+
+    def _close_log_handlers(self) -> None:
+        for handler in list(self.logger.handlers):
+            try:
+                handler.flush()
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+            finally:
+                self.logger.removeHandler(handler)
 
     @staticmethod
     def _setup_logger(log_dir: Path) -> logging.Logger:
@@ -1221,12 +1518,14 @@ def _server_name() -> str:
     return f"FeishuClockoutAssistant-{identity}"
 
 
-def _notify_existing_instance(name: str) -> bool:
+def _notify_existing_instance(name: str, command: bytes = IPC_SHOW) -> bool:
+    if _parse_ipc_command(command) is None:
+        raise ValueError("本地实例命令无效")
     socket = QLocalSocket()
     socket.connectToServer(name)
     if not socket.waitForConnected(1000):
         return False
-    socket.write(b"show")
+    socket.write(command)
     socket.flush()
     if socket.bytesToWrite() > 0:
         socket.waitForBytesWritten(1000)
@@ -1235,21 +1534,28 @@ def _notify_existing_instance(name: str) -> bool:
     return True
 
 
+def _dispatch_ipc_command(controller: AppController, payload: bytes) -> bytes:
+    command = _parse_ipc_command(payload)
+    if command is None or not controller.handle_instance_command(command):
+        return b"rejected"
+    return b"ok"
+
+
 def run() -> int:
+    request = _parse_launch_request(sys.argv[1:])
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setQuitOnLastWindowClosed(False)
-    _apply_light_palette(app)
-    app.setStyleSheet(APP_QSS)
     name = _server_name()
-    if _notify_existing_instance(name):
+    if _notify_existing_instance(name, request.ipc_command):
         return 0
     QLocalServer.removeServer(name)
     server = QLocalServer(app)
     if not server.listen(name):
         return 1
-    background = any(argument in {"--background", "--startup"} for argument in sys.argv[1:])
-    controller = AppController(app, runtime_paths(), background)
+    controller = AppController(app, runtime_paths(), request.background)
+    if request.ipc_command == IPC_WAKE:
+        controller.handle_instance_command("wake")
 
     def activate_from_socket() -> None:
         connection = server.nextPendingConnection()
@@ -1257,12 +1563,10 @@ def run() -> int:
             return
 
         def handle_message() -> None:
-            if bytes(connection.readAll()) == b"show":
-                controller.window.show_from_tray()
-                controller.log("已从第二次启动请求唤回主界面")
-                connection.write(b"ok")
-                connection.flush()
-                connection.waitForBytesWritten(500)
+            response = _dispatch_ipc_command(controller, bytes(connection.readAll()))
+            connection.write(response)
+            connection.flush()
+            connection.waitForBytesWritten(500)
             connection.disconnectFromServer()
 
         if connection.bytesAvailable():

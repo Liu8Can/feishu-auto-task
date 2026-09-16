@@ -15,12 +15,14 @@ def test_config_round_trip_preserves_chinese_safe_json(tmp_path: object) -> None
         fixed_checkin_time="09:10",
         fixed_clockout_time="19:10",
         mode="automatic",
+        theme_mode="dark",
     )
 
     save_config(path, config)
 
     assert load_config(path) == config
     assert json.loads(path.read_text(encoding="utf-8"))["buffer_minutes"] == 8
+    assert json.loads(path.read_text(encoding="utf-8"))["theme_mode"] == "dark"
 
 
 def test_old_config_without_schedule_fields_uses_new_defaults(tmp_path: object) -> None:
@@ -57,6 +59,7 @@ def test_old_config_without_schedule_fields_uses_new_defaults(tmp_path: object) 
         {"fixed_checkin_time": "19:00", "fixed_clockout_time": "18:50"},
         {"fixed_clockout_time": "not-a-time"},
         {"mode": "unsafe"},
+        {"theme_mode": "sepia"},
     ],
 )
 def test_invalid_config_is_rejected(changes: dict[str, object]) -> None:

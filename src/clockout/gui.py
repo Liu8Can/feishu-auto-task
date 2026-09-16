@@ -66,7 +66,7 @@ class ClockoutDemoApp:
         self.root.after(1000, self._tick)
 
     def _build_window(self) -> None:
-        self.root.title("飞书动态下班打卡助手 - Demo")
+        self.root.title("飞书自动打卡助手 - Demo")
         self.root.geometry("780x660")
         self.root.minsize(700, 610)
         self.root.configure(bg="#F3F5F7")
@@ -128,7 +128,7 @@ class ClockoutDemoApp:
         outer = ttk.Frame(self.root, padding=(24, 20))
         outer.pack(fill="both", expand=True)
 
-        ttk.Label(outer, text="飞书动态下班打卡助手", style="Title.TLabel").pack(
+        ttk.Label(outer, text="飞书自动打卡助手", style="Title.TLabel").pack(
             anchor="w"
         )
         ttk.Label(
