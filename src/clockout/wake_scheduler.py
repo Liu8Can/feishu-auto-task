@@ -230,6 +230,13 @@ $task = $matches[0]
 $actions = @($task.Actions)
 $action = $actions[0]
 $triggers = @($task.Triggers)
+$principalSid = try {
+    ([System.Security.Principal.NTAccount]$task.Principal.UserId).Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+} catch {
+    $task.Principal.UserId
+}
 $times = @(
     $triggers | ForEach-Object {
         ([datetime]$_.StartBoundary).ToString(
@@ -245,7 +252,7 @@ $allDaily = $triggers.Count -gt 0 -and @(
     exists = $true
     name = $task.TaskName
     description = $task.Description
-    user_sid = $task.Principal.UserId
+    user_sid = $principalSid
     executable = $action.Execute
     arguments = $action.Arguments
     daily_times = @($times)

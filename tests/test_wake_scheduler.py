@@ -234,6 +234,12 @@ def test_native_query_preserves_duplicate_triggers_and_structure_counts(
     assert task.trigger_count == 2
 
 
+def test_native_query_normalizes_principal_name_to_sid() -> None:
+    assert "NTAccount" in wake_scheduler._QUERY_SCRIPT
+    assert "SecurityIdentifier" in wake_scheduler._QUERY_SCRIPT
+    assert "user_sid = $principalSid" in wake_scheduler._QUERY_SCRIPT
+
+
 @pytest.mark.parametrize("missing_field", ["action_count", "trigger_count"])
 def test_native_query_rejects_missing_structure_counts(
     monkeypatch: pytest.MonkeyPatch, missing_field: str
