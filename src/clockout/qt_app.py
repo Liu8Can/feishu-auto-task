@@ -687,7 +687,7 @@ class AppController(QObject):
         self._active_task_name = ""
         self._active_task_timed_out = False
         self._worker_generation = 0
-        self._worker_timeout_ms = 30000
+        self._worker_timeout_ms = 60000
         self._pending_worker: tuple[
             Callable[[], object],
             Callable[[object], None],

@@ -376,6 +376,7 @@ def test_preclick_exception_records_distinct_outcome(tmp_path: object) -> None:
 
     assert result.status == "retry_waiting"
     assert "点击前安全检查未通过" in result.message
+    assert "foreground changed" in result.message
     assert result.next_retry_time == now + timedelta(minutes=5)
     assert state is not None
     assert state.outcome == "aborted_before_click"

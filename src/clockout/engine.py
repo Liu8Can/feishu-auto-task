@@ -17,7 +17,7 @@ from .core import (
 from .storage import DailyState, JsonStateStore, PunchState
 
 
-LOGGER = logging.getLogger("clockout-demo")
+LOGGER = logging.getLogger("clockout")
 
 
 class AttendanceAdapter(Protocol):
@@ -395,7 +395,7 @@ class ClockoutEngine:
                 (
                     "点击调用失败，结果不明确，今天不会自动重试"
                     if invocation_started
-                    else "点击前安全检查未通过，已安排有限重试"
+                    else f"点击前安全检查未通过：{exc}；已安排有限重试"
                 ),
                 first.check_in_time,
                 eligible_time,
@@ -618,7 +618,7 @@ class ClockoutEngine:
                 (
                     "上班点击调用失败，结果不明确，今天不会自动重试"
                     if invocation_started
-                    else "上班点击前安全检查未通过，已安排有限重试"
+                    else f"上班点击前安全检查未通过：{exc}；已安排有限重试"
                 ),
                 eligible_time=eligible_time,
                 next_retry_time=retry_at,

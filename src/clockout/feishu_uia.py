@@ -312,10 +312,10 @@ class FeishuUiaAdapter:
         if token is not None and (
             context.container_id != token.container_id
             or context.button_id != token.button_id
-            or context.container_runtime_id != token.container_runtime_id
-            or context.button_runtime_id != token.button_runtime_id
+            or context.container_runtime_id[:2] != token.container_runtime_id[:2]
+            or context.button_runtime_id[:2] != token.button_runtime_id[:2]
         ):
-            raise RuntimeError("点击前考勤容器或按钮实例已经变化")
+            raise RuntimeError("点击前考勤容器或按钮路径已经变化")
         if len(context.buttons) != 1:
             raise RuntimeError("点击前打卡按钮不唯一")
         button = context.buttons[0]
@@ -403,8 +403,8 @@ class FeishuUiaAdapter:
         if int(win32gui.GetForegroundWindow()) != window_handle:
             raise RuntimeError("点击前考勤窗口未处于前台")
         button_runtime_id = self._runtime_identity(button, window)
-        if not button_runtime_id or button_runtime_id != token.button_runtime_id:
-            raise RuntimeError("点击前打卡按钮实例已经变化")
+        if not button_runtime_id:
+            raise RuntimeError("点击前无法确认打卡按钮实例")
         rectangle = button.rectangle()
         if rectangle.right <= rectangle.left or rectangle.bottom <= rectangle.top:
             raise RuntimeError("点击前打卡目标位置无效")

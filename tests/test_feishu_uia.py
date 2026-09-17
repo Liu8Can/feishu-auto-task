@@ -972,34 +972,26 @@ def test_text_click_reports_when_physical_invocation_has_started(
     assert "physical click failed" in str(error.value)
 
 
-def test_text_click_revalidates_runtime_identity_after_activation(
+def test_text_click_allows_runtime_redraw_after_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter, root, target, signature = _prepare_text_click(monkeypatch)
-    page = adapter._attendance_page(date(2026, 9, 15), require_trusted=True)
-    assert page is not None
-    context = page[1]
-    replaced_context = feishu_uia._AttendanceContext(
-        texts=context.texts,
-        buttons=context.buttons,
-        container_id=context.container_id,
-        button_id=context.button_id,
-        container_runtime_id=context.container_runtime_id,
-        button_runtime_id=(100, 200, 999),
-    )
-    pages = iter(
-        ((root, context), (root, context), (root, replaced_context))
-    )
+    desktop = SimpleNamespace(from_point=lambda x, y: target)
+    monkeypatch.setattr(feishu_uia, "Desktop", lambda **kwargs: desktop)
     monkeypatch.setattr(
-        adapter,
-        "_attendance_page",
-        lambda *args, **kwargs: next(pages),
+        feishu_uia.win32gui, "GetForegroundWindow", lambda: root.handle
     )
 
-    with pytest.raises(RuntimeError):
-        adapter.click_clock_out(signature)
+    def focus_after_redraw() -> None:
+        root.focus_count += 1
+        target.element_info.runtime_id = (999,)
+
+    root.set_focus = focus_after_redraw  # type: ignore[method-assign]
+
+    adapter.click_clock_out(signature)
+
     assert root.focus_count == 1
-    assert target.click_input_count == 0
+    assert target.click_input_count == 1
 
 
 def _prepare_action_token(
@@ -1127,6 +1119,36 @@ def test_click_token_is_one_shot_and_cannot_be_replayed(
         adapter.execute_click(token)
 
     assert target.invoke_count == 1
+
+
+def test_execute_allows_runtime_ids_to_change_when_stable_paths_still_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT
+    )
+    container = target.parent()
+    container.element_info.runtime_id = (901,)
+    target.element_info.runtime_id = (902,)
+
+    assert adapter.execute_click(token)
+    assert target.invoke_count == 1
+    assert adapter._click_state == "idle"
+
+
+def test_execute_rejects_replacement_window_with_same_stable_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, root, target, token = _prepare_action_token(
+        monkeypatch, PunchAction.CHECK_OUT
+    )
+    root.handle = 999
+
+    with pytest.raises(ClockoutClickError) as error:
+        adapter.execute_click(token)
+
+    assert not error.value.invocation_started
+    assert target.invoke_count == 0
 
 
 def test_prepare_is_serial_and_exact_cancel_releases_it(
@@ -1357,7 +1379,7 @@ def test_runtime_dedup_only_removes_the_same_control_instance() -> None:
     assert different == [first_button, second_button]
 
 
-def test_third_scan_rejects_replaced_runtime_control(
+def test_third_scan_rejects_changed_persistent_button_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = FakeControl("Window", (1,))
@@ -1401,7 +1423,10 @@ def test_third_scan_rejects_replaced_runtime_control(
     monkeypatch.setattr(
         adapter,
         "_attendance_page",
-        lambda *args, **kwargs: (root, context),
+        lambda *args, **kwargs: (
+            root,
+            replace(context, button_id="different-button-path"),
+        ),
     )
 
     with pytest.raises(RuntimeError):
